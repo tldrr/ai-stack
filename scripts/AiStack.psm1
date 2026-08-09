@@ -861,19 +861,116 @@ function Merge-CodexMcpConfig {
     return $false
 }
 
+function Invoke-AiStackNative {
+    param(
+        [Parameter(Mandatory = $true)][string]$Command,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $rawOutput = & $Command @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    $output = @($rawOutput | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) {
+            $_.Exception.Message
+        }
+        else {
+            [string]$_
+        }
+    } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    return [pscustomobject]@{
+        ExitCode = $exitCode
+        Output = $output
+    }
+}
+
 function Invoke-IdempotentNative {
     param(
         [Parameter(Mandatory = $true)][string]$Command,
         [Parameter(Mandatory = $true)][string[]]$Arguments
     )
 
-    $output = & $Command @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0 -and ($output -join ' ') -notmatch '(?i)already (?:added|installed|exists)') {
-        throw "$Command failed: $($output -join [Environment]::NewLine)"
+    $result = Invoke-AiStackNative -Command $Command -Arguments $Arguments
+    if ($result.ExitCode -ne 0 -and
+        ($result.Output -join ' ') -notmatch '(?i)already (?:added|installed|exists)') {
+        throw "$Command failed: $($result.Output -join [Environment]::NewLine)"
     }
-    if ($output) {
-        Write-Host ($output -join [Environment]::NewLine)
+    if ($result.Output) {
+        Write-Host ($result.Output -join [Environment]::NewLine)
     }
+}
+
+function Test-CopilotPluginInstalled {
+    param([Parameter(Mandatory = $true)][string]$Command)
+
+    $result = Invoke-AiStackNative -Command $Command -Arguments @('plugin', 'list')
+    if ($result.ExitCode -ne 0) {
+        throw "$Command plugin list failed: $($result.Output -join [Environment]::NewLine)"
+    }
+    return ($result.Output -join [Environment]::NewLine) -match
+        '(?im)^\s*(?:[^\w\s]\s*)?agentmemory\s+\(v'
+}
+
+function Get-CodexPluginState {
+    param([Parameter(Mandatory = $true)][string]$Command)
+
+    $marketplaceResult = Invoke-AiStackNative `
+        -Command $Command `
+        -Arguments @('plugin', 'marketplace', 'list', '--json')
+    if ($marketplaceResult.ExitCode -ne 0) {
+        throw "$Command plugin marketplace list failed: $($marketplaceResult.Output -join [Environment]::NewLine)"
+    }
+    $pluginResult = Invoke-AiStackNative `
+        -Command $Command `
+        -Arguments @('plugin', 'list', '--json')
+    if ($pluginResult.ExitCode -ne 0) {
+        throw "$Command plugin list failed: $($pluginResult.Output -join [Environment]::NewLine)"
+    }
+    try {
+        $marketplaces = ($marketplaceResult.Output -join [Environment]::NewLine) | ConvertFrom-Json
+        $plugins = ($pluginResult.Output -join [Environment]::NewLine) | ConvertFrom-Json
+    }
+    catch {
+        throw "Cannot parse Codex plugin state: $($_.Exception.Message)"
+    }
+    return [pscustomobject]@{
+        MarketplaceInstalled = @($marketplaces.marketplaces).name -contains 'agentmemory'
+        PluginInstalled = @($plugins.installed).pluginId -contains 'agentmemory@agentmemory'
+    }
+}
+
+function Get-AiStackClientCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$WinGetPackage,
+        [Parameter(Mandatory = $true)][string]$WinGetExecutable
+    )
+
+    $command = Get-Command $Name -ErrorAction SilentlyContinue
+    if ($command) {
+        return $command.Source
+    }
+    if ($env:OS -eq 'Windows_NT') {
+        $packages = Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages'
+        $packagePath = Get-ChildItem -LiteralPath $packages -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "${WinGetPackage}_*" } |
+            Select-Object -First 1 -ExpandProperty FullName
+        $candidate = if ($packagePath) {
+            Get-ChildItem -LiteralPath $packagePath `
+                -Filter $WinGetExecutable -File -Recurse -ErrorAction SilentlyContinue |
+                Select-Object -First 1 -ExpandProperty FullName
+        }
+        if ($candidate) {
+            return $candidate
+        }
+    }
+    return $null
 }
 
 function Install-AiStackClients {
@@ -887,8 +984,17 @@ function Install-AiStackClients {
         $copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $homePath '.copilot' }
         $copilotConfig = Join-Path $copilotHome 'mcp-config.json'
         [void](Merge-CopilotMcpConfig -Path $copilotConfig -LauncherPath $script:McpLauncherPath)
-        if (Get-Command copilot -ErrorAction SilentlyContinue) {
-            Invoke-IdempotentNative -Command 'copilot' -Arguments @('plugin', 'install', 'rohitg00/agentmemory:plugin')
+        $copilotCommand = Get-AiStackClientCommand `
+            -Name 'copilot' `
+            -WinGetPackage 'GitHub.Copilot' `
+            -WinGetExecutable 'copilot.exe'
+        if ($copilotCommand) {
+            if (Test-CopilotPluginInstalled -Command $copilotCommand) {
+                Write-Host 'Copilot AgentMemory plugin is already installed.'
+            }
+            else {
+                Invoke-IdempotentNative -Command $copilotCommand -Arguments @('plugin', 'install', 'rohitg00/agentmemory:plugin')
+            }
         }
         else {
             Write-Warning 'Copilot CLI was not found. MCP configuration was installed; run the official plugin command after installing Copilot CLI.'
@@ -899,9 +1005,21 @@ function Install-AiStackClients {
         $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $homePath '.codex' }
         $codexConfig = Join-Path $codexHome 'config.toml'
         [void](Merge-CodexMcpConfig -Path $codexConfig -LauncherPath $script:McpLauncherPath)
-        if (Get-Command codex -ErrorAction SilentlyContinue) {
-            Invoke-IdempotentNative -Command 'codex' -Arguments @('plugin', 'marketplace', 'add', 'rohitg00/agentmemory')
-            Invoke-IdempotentNative -Command 'codex' -Arguments @('plugin', 'add', 'agentmemory@agentmemory')
+        $codexCommand = Get-AiStackClientCommand `
+            -Name 'codex' `
+            -WinGetPackage 'OpenAI.Codex' `
+            -WinGetExecutable 'codex-*-windows-msvc.exe'
+        if ($codexCommand) {
+            $codexState = Get-CodexPluginState -Command $codexCommand
+            if (-not $codexState.MarketplaceInstalled) {
+                Invoke-IdempotentNative -Command $codexCommand -Arguments @('plugin', 'marketplace', 'add', 'rohitg00/agentmemory')
+            }
+            if (-not $codexState.PluginInstalled) {
+                Invoke-IdempotentNative -Command $codexCommand -Arguments @('plugin', 'add', 'agentmemory@agentmemory')
+            }
+            if ($codexState.MarketplaceInstalled -and $codexState.PluginInstalled) {
+                Write-Host 'Codex AgentMemory marketplace and plugin are already installed.'
+            }
         }
         else {
             Write-Warning 'Codex CLI was not found. MCP configuration was installed; add the official marketplace plugin after installing Codex.'

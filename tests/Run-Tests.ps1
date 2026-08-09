@@ -244,6 +244,17 @@ command = "old"
         Assert-Equal 1 ([regex]::Matches($second, '\[mcp_servers\.agentmemory\]').Count) 'AgentMemory table was duplicated.'
     }
 
+    Invoke-Test 'Native installer tolerates successful stderr' {
+        $module = Get-Module AiStack
+        & $module {
+            Invoke-IdempotentNative -Command 'powershell.exe' -Arguments @(
+                '-NoProfile',
+                '-Command',
+                "[Console]::Error.WriteLine('expected warning'); exit 0"
+            )
+        }
+    }
+
     Invoke-Test 'Doctor reports healthy injected probes' {
         $results = Invoke-AiStackDoctor `
             -CommandProbe { param($name) $true } `
