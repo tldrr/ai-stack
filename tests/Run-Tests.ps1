@@ -198,6 +198,7 @@ try {
         Assert-True ($envBefore -match '(?m)^AGENTMEMORY_CONSOLE_PORT=3114\r?$') 'Setup did not upgrade an existing environment with the Console port.'
         Assert-True ($envBefore -match '(?m)^AGENTMEMORY_INJECT_CONTEXT=true\r?$') 'Setup did not enable context injection for an existing environment.'
         Assert-True ($envBefore -match '(?m)^AGENTMEMORY_AUTO_COMPRESS=false\r?$') 'Setup did not keep per-observation auto-compression disabled.'
+        Assert-True ($envBefore -match '(?m)^AGENTMEMORY_SLOTS=true\r?$') 'Setup did not enable structured memory slots.'
         Assert-True ($envBefore -match '(?m)^CLOUDFLARE_CONSOLE_HOSTNAME=memory-console\.example\.com\r?$') 'Setup did not add the optional console hostname.'
         $updatedCopilot = [System.IO.File]::ReadAllText($copilotConfig) | ConvertFrom-Json
         Assert-Equal (Join-Path $testDataPath 'agentmemory-mcp.ps1') $updatedCopilot.mcpServers.agentmemory.args[-1] 'Copilot retained the legacy launcher path.'
@@ -645,6 +646,8 @@ command = "old"
         Assert-True ($importer -match '\$SessionIds\.Count -eq 0 -and \$ObservationIds\.Count -eq 0') 'Append-only transcript invalidation exits before clearing derived data.'
         Assert-True ($importer -match 'ConsolidationManifestPath') 'Failed consolidation cannot be resumed independently.'
         Assert-True ($importer -match '\$pipelineErrors\.Count -gt 0') 'Partial consolidation pipeline failures are checkpointed as success.'
+        Assert-True ($importer -match 'infer-memory-projects') 'Enrichment does not backfill project scope on durable memories.'
+        Assert-True ($importer -match 'ProjectScopesAmbiguous') 'Enrichment does not report ambiguous project scopes.'
         Assert-True ($importer -match '\$Force -and -not \$DryRun') 'Forced summary regeneration does not reset the graph.'
         Assert-True ($importer -match 'resetDerived = \(-not \$consolidationCurrent -or \$Force\)') 'Resumed enrichment preserves stale derived tiers.'
         Assert-True ($importer -match 'Fallback \$turnFallback') 'Copilot turns without timestamps are not deterministic.'

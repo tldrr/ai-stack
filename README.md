@@ -107,7 +107,7 @@ Open the local interfaces at:
 | `install-clients` | Interactively selects local or remote AgentMemory, merges MCP config, and installs official upstream plugins |
 | `install-capture [-Agent ...]` | Installs official live-capture integrations for Copilot, pi, and Hermes |
 | `import-sessions [-Source ...] [-DryRun]` | Backfills supported local conversation histories into AgentMemory |
-| `enrich-sessions [-Source ...] [-DryRun]` | Resumably summarizes imports, builds graph batches, and consolidates memory |
+| `enrich-sessions [-Source ...] [-DryRun]` | Resumably summarizes imports, builds graph batches, consolidates memory, and infers project scope |
 | `uninstall` | Removes containers/network but preserves `~\.ai-stack` |
 | `uninstall -DeleteData` | Deletes AgentMemory and Copilot data after typing `DELETE` |
 
@@ -116,6 +116,8 @@ used only in automation that intentionally discards all memories and Copilot
 login state. For `import-sessions`, it reprocesses unchanged sessions without
 creating duplicate observation IDs. For `enrich-sessions`, it regenerates
 summaries and reruns consolidation; completed graph batches remain checkpointed.
+Every non-dry enrichment run also applies AgentMemory's project-scope migration
+to newly consolidated durable memories and reports any ambiguous records.
 
 Upgrades from older ai-stack releases are automatic. Stop the old stack, then
 run `setup`; the command moves root `.env`/`.state` files and copies the two
@@ -248,6 +250,9 @@ context before a new turn. Rerun `install-capture` after changing this setting.
 [#138](https://github.com/rohitg00/agentmemory/issues/138) documents excessive
 LLM usage from per-observation compression. Summarization, consolidation, and
 knowledge-graph extraction remain enabled without that costly feature.
+`AGENTMEMORY_SLOTS=true` enables pinned, size-limited structured context such as
+an interview story bank or career profile without enabling per-observation LLM
+work.
 
 Restart each installed agent after installation. Copilot app can require a
 one-time plugin trust action in its UI. Capture stores source observations

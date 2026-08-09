@@ -485,6 +485,7 @@ function Initialize-AiStackConfiguration {
         AGENTMEMORY_CONSOLE_PORT = '3114'
         AGENTMEMORY_INJECT_CONTEXT = 'true'
         AGENTMEMORY_AUTO_COMPRESS = 'false'
+        AGENTMEMORY_SLOTS = 'true'
         CLOUDFLARE_CONSOLE_HOSTNAME = 'memory-console.example.com'
     }).GetEnumerator()) {
         if (-not $values.ContainsKey($default.Key)) {

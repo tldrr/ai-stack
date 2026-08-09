@@ -1232,6 +1232,27 @@ function ConvertFrom-AiStackLastJsonLine {
     throw "$Operation did not return a JSON result."
 }
 
+function Invoke-AiStackMemoryProjectInference {
+    param(
+        [Parameter(Mandatory = $true)][string]$BaseUrl,
+        [Parameter(Mandatory = $true)][hashtable]$Headers
+    )
+
+    $result = Invoke-RestMethod `
+        -UseBasicParsing `
+        -Uri "$BaseUrl/agentmemory/migrate" `
+        -Headers $Headers `
+        -ContentType 'application/json' `
+        -Body '{"step":"infer-memory-projects"}' `
+        -Method Post `
+        -TimeoutSec 180
+    if (-not $result.success) {
+        throw 'AgentMemory could not infer project scope for durable memories.'
+    }
+    Write-Host "Memory project scopes: $($result.updated) updated, $($result.ambiguous) ambiguous."
+    return $result
+}
+
 function Invoke-AiStackSessionEnrichment {
     [CmdletBinding()]
     param(
@@ -1353,6 +1374,7 @@ function Invoke-AiStackSessionEnrichment {
 
     $newWork = [int]$summaryResult.completed + [int]$graphResult.succeeded
     if ($newWork -eq 0 -and $consolidationCurrent -and -not $Force) {
+        $projectResult = Invoke-AiStackMemoryProjectInference -BaseUrl $baseUrl -Headers $headers
         Write-Host 'Historical enrichment is already current; consolidation was not rerun.'
         return [pscustomobject]@{
             DryRun = $false
@@ -1360,6 +1382,8 @@ function Invoke-AiStackSessionEnrichment {
             Summaries = 0
             GraphBatches = 0
             Consolidated = $false
+            ProjectScopesUpdated = $projectResult.updated
+            ProjectScopesAmbiguous = $projectResult.ambiguous
         }
     }
 
@@ -1404,6 +1428,7 @@ function Invoke-AiStackSessionEnrichment {
     if (-not $pipelineResult.success -or $pipelineErrors.Count -gt 0) {
         throw "AgentMemory consolidation failed: $($pipelineResult.reason)"
     }
+    $projectResult = Invoke-AiStackMemoryProjectInference -BaseUrl $baseUrl -Headers $headers
     $consolidationManifest = [ordered]@{
         version = 1
         stateHash = $consolidationStateHash
@@ -1421,5 +1446,7 @@ function Invoke-AiStackSessionEnrichment {
         GraphBatches = $graphResult.succeeded
         Memories = $memoryResult.consolidated
         Consolidated = $true
+        ProjectScopesUpdated = $projectResult.updated
+        ProjectScopesAmbiguous = $projectResult.ambiguous
     }
 }
