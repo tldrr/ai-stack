@@ -1,0 +1,102 @@
+name: ${COMPOSE_PROJECT_NAME:-ai-stack}
+
+services:
+  litellm:
+    image: ${LITELLM_IMAGE:-ghcr.io/berriai/litellm:v1.95.0}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${LITELLM_PORT:-4000}:4000"
+    environment:
+      GITHUB_COPILOT_TOKEN_DIR: /var/lib/litellm/github-copilot
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?Run .\ai-stack.ps1 setup first}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - ./config/litellm.yaml:/app/config.yaml:ro
+      - github-copilot-token:/var/lib/litellm/github-copilot
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      start_period: 5m
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    networks:
+      - ai-stack
+
+  agentmemory:
+    build:
+      context: ./docker/agentmemory
+      args:
+        AGENTMEMORY_VERSION: "0.9.28"
+        III_VERSION: "0.11.2"
+        III_SDK_VERSION: "0.11.2"
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${AGENTMEMORY_REST_PORT:-3111}:3111"
+      - "127.0.0.1:${AGENTMEMORY_VIEWER_PORT:-3113}:3113"
+    environment:
+      OPENAI_API_KEY: ${LITELLM_MASTER_KEY:?Run .\ai-stack.ps1 setup first}
+      OPENAI_BASE_URL: http://litellm:4000/v1
+      OPENAI_MODEL: ${AGENTMEMORY_LLM_MODEL:-gpt-5.6-sol}
+      EMBEDDING_PROVIDER: ${AGENTMEMORY_EMBEDDING_PROVIDER:-local}
+      OPENAI_EMBEDDING_MODEL: text-embedding-3-small
+      AGENTMEMORY_VIEWER_HOST: 0.0.0.0
+      VIEWER_ALLOWED_HOSTS: localhost:${AGENTMEMORY_VIEWER_PORT:-3113},127.0.0.1:${AGENTMEMORY_VIEWER_PORT:-3113},${CLOUDFLARE_VIEWER_HOSTNAME:-memory.example.com}
+      VIEWER_ALLOWED_ORIGINS: http://localhost:${AGENTMEMORY_VIEWER_PORT:-3113},http://127.0.0.1:${AGENTMEMORY_VIEWER_PORT:-3113},https://${CLOUDFLARE_VIEWER_HOSTNAME:-memory.example.com}
+    secrets:
+      - agentmemory-secret
+    volumes:
+      - agentmemory-data:/data
+    depends_on:
+      litellm:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3111/agentmemory/livez || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    networks:
+      - ai-stack
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.7.3
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    command:
+      - tunnel
+      - --no-autoupdate
+      - run
+      - --token
+      - ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      agentmemory:
+        condition: service_healthy
+    networks:
+      - ai-stack
+
+secrets:
+  agentmemory-secret:
+    file: ./.state/agentmemory-secret
+
+volumes:
+  agentmemory-data:
+  github-copilot-token:
+
+networks:
+  ai-stack:
+    driver: bridge
