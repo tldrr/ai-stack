@@ -310,24 +310,47 @@ generated config file, not dashboard state:
 | --- | --- |
 | `CLOUDFLARE_REST_HOSTNAME` | `http://agentmemory:3111` |
 | `CLOUDFLARE_VIEWER_HOSTNAME` | `http://agentmemory:3113` |
+| `CLOUDFLARE_CONSOLE_HOSTNAME` | `http://iii-console:3114` after Access verification |
 
 Install `cloudflared`, open the generated configuration, set
-`CLOUDFLARE_TUNNEL_NAME` and both hostnames, then create and start the tunnel:
+`CLOUDFLARE_TUNNEL_NAME`, REST, and viewer hostnames. Before enabling the
+console route, create a Cloudflare Zero Trust **Access > Applications >
+Self-hosted** application for the complete console hostname. Add an identity
+allow policy restricted to your account or organization and require MFA. Do not
+use a Bypass policy.
+
+Cloudflare Universal SSL normally covers the zone apex and one subdomain level.
+Names such as `api.mem.example.com` and `iii.mem.example.com` may therefore
+require **SSL/TLS > Edge Certificates > Total TLS** or an Advanced Certificate
+covering `*.mem.example.com` before Access can serve them. `configure-tunnel`
+fails closed while DNS, edge TLS, or the Access challenge is unavailable.
+Failed preflight also restores the previous local environment and tunnel
+configuration, so an existing deployment remains active. Use
+`configure-tunnel -DisableConsole` to remove a previously configured console
+origin route and recreate a running connector without it.
 
 ```powershell
 winget install --id Cloudflare.cloudflared --exact
 .\ai-stack.ps1 configure
-.\ai-stack.ps1 configure-tunnel
+.\ai-stack.ps1 configure-tunnel `
+  -RestHostname api.mem.example.com `
+  -ViewerHostname mem.example.com `
+  -ConsoleHostname iii.mem.example.com
 .\ai-stack.ps1 start -Tunnel
 ```
 
 On the first run, `cloudflared` opens one browser authorization. It uses that
 login to create the named tunnel, generate tunnel-specific credentials, and
-create both DNS records; there is no API-token creation or secret copy/paste.
+create the DNS records; there is no API-token creation or secret copy/paste.
 Later runs reuse the local authorization and tunnel credentials. The command
 writes
 `~\.ai-stack\cloudflared\config.yml`, validates its ingress rules, and idempotently
-creates both DNS routes. Tunnel credentials remain in the git-ignored
+creates the DNS routes. For iii Console, it first creates DNS while the tunnel
+still returns its catch-all `404`, then verifies that an unauthenticated request
+is redirected to Cloudflare Access. Only that verified challenge enables
+`http://iii-console:3114`; otherwise configuration fails closed and leaves the
+console origin unpublished. A running connector is recreated after a successful
+change. Tunnel credentials remain in the git-ignored
 `~\.ai-stack\cloudflared\credentials.json`. Docker mounts this directory
 read-only, and `restart: unless-stopped` provides autostart with Docker Desktop.
 
@@ -349,9 +372,12 @@ Do not also run a token-installed Windows `Cloudflared` service for this stack.
 After the Docker-managed connector is healthy, remove the old service from an
 elevated terminal with `cloudflared service uninstall`.
 
-The tunnel only exposes AgentMemory REST and its viewer. iii Console is
-intentionally excluded because it has no authentication and can invoke
-functions or mutate raw state. It does not make
+The tunnel can expose AgentMemory REST, viewer, and the Access-gated iii
+Console. The Console route is never generated without a verified Access login
+challenge because it has no application authentication and can invoke functions
+or mutate raw state. Cloudflare Access protects the SPA, same-origin
+`/api/engine/*` requests, and WebSocket connection with its authenticated
+session cookie. This does not make
 AgentMemory compatible with ChatGPT remote MCP and must not be configured as a
 ChatGPT connector.
 

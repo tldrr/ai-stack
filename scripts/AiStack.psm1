@@ -406,6 +406,7 @@ function Initialize-AiStackConfiguration {
         AGENTMEMORY_CONSOLE_PORT = '3114'
         AGENTMEMORY_INJECT_CONTEXT = 'true'
         AGENTMEMORY_AUTO_COMPRESS = 'false'
+        CLOUDFLARE_CONSOLE_HOSTNAME = 'memory-console.example.com'
     }).GetEnumerator()) {
         if (-not $values.ContainsKey($default.Key)) {
             $content = Set-DotEnvValue -Content $content -Name $default.Key -Value $default.Value
@@ -501,6 +502,7 @@ function New-CloudflareTunnelConfig {
         [Parameter(Mandatory = $true)][string]$TunnelId,
         [Parameter(Mandatory = $true)][string]$RestHostname,
         [Parameter(Mandatory = $true)][string]$ViewerHostname,
+        [string]$ConsoleHostname,
         [string]$Path = $script:CloudflareConfigPath
     )
 
@@ -510,21 +512,36 @@ function New-CloudflareTunnelConfig {
     }
     Assert-CloudflareHostname -Name 'CLOUDFLARE_REST_HOSTNAME' -Hostname $RestHostname
     Assert-CloudflareHostname -Name 'CLOUDFLARE_VIEWER_HOSTNAME' -Hostname $ViewerHostname
-    if ($RestHostname -ieq $ViewerHostname) {
-        throw 'Cloudflare REST and viewer hostnames must be different.'
+    if (-not [string]::IsNullOrWhiteSpace($ConsoleHostname)) {
+        Assert-CloudflareHostname -Name 'CLOUDFLARE_CONSOLE_HOSTNAME' -Hostname $ConsoleHostname
+    }
+    $hostnames = @($RestHostname, $ViewerHostname, $ConsoleHostname) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    if (@($hostnames | ForEach-Object { $_.ToLowerInvariant() } | Select-Object -Unique).Count -ne $hostnames.Count) {
+        throw 'Cloudflare REST, viewer, and console hostnames must be different.'
     }
 
-    $content = @"
-tunnel: $($parsedTunnelId.ToString())
-credentials-file: /etc/cloudflared/credentials.json
-
-ingress:
-  - hostname: $RestHostname
-    service: http://agentmemory:3111
-  - hostname: $ViewerHostname
-    service: http://agentmemory:3113
-  - service: http_status:404
-"@ + [Environment]::NewLine
+    $ingress = @(
+        "  - hostname: $RestHostname"
+        '    service: http://agentmemory:3111'
+        "  - hostname: $ViewerHostname"
+        '    service: http://agentmemory:3113'
+    )
+    if (-not [string]::IsNullOrWhiteSpace($ConsoleHostname)) {
+        $ingress += @(
+            "  - hostname: $ConsoleHostname"
+            '    service: http://iii-console:3114'
+        )
+    }
+    $ingress += '  - service: http_status:404'
+    $content = @(
+        "tunnel: $($parsedTunnelId.ToString())"
+        'credentials-file: /etc/cloudflared/credentials.json'
+        ''
+        'ingress:'
+        $ingress
+        ''
+    ) -join [Environment]::NewLine
 
     $directory = Split-Path $Path -Parent
     if (-not (Test-Path -LiteralPath $directory)) {
@@ -617,11 +634,127 @@ function Find-CloudflareTunnelsByName {
     })
 }
 
+function Test-CloudflareAccessProtection {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Hostname,
+        [scriptblock]$Probe = {
+            param($uri)
+            $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+            if (-not $curl) {
+                $curl = Get-Command curl -CommandType Application -ErrorAction Stop
+            }
+            $nullDevice = if ($env:OS -eq 'Windows_NT') { 'NUL' } else { '/dev/null' }
+            $headers = & $curl.Source `
+                --silent `
+                --show-error `
+                --head `
+                --max-redirs 0 `
+                --dump-header - `
+                --output $nullDevice `
+                $uri
+            if ($LASTEXITCODE -ne 0) {
+                throw "Could not probe $uri."
+            }
+            $text = $headers -join [Environment]::NewLine
+            $statusMatches = [regex]::Matches($text, '(?im)^HTTP/\S+\s+(\d{3})')
+            if ($statusMatches.Count -eq 0) {
+                throw "Cloudflare Access probe for $uri returned no HTTP status."
+            }
+            $locationMatches = [regex]::Matches($text, '(?im)^location:\s*(\S+)\s*$')
+            [pscustomobject]@{
+                StatusCode = [int]$statusMatches[$statusMatches.Count - 1].Groups[1].Value
+                Location = if ($locationMatches.Count -gt 0) {
+                    $locationMatches[$locationMatches.Count - 1].Groups[1].Value
+                }
+                else {
+                    ''
+                }
+                Server = [regex]::IsMatch($text, '(?im)^server:\s*cloudflare\s*$')
+                CfRay = [regex]::IsMatch($text, '(?im)^cf-ray:\s*\S+')
+            }
+        }
+    )
+
+    Assert-CloudflareHostname -Name 'CLOUDFLARE_CONSOLE_HOSTNAME' -Hostname $Hostname
+    try {
+        $result = & $Probe "https://$Hostname/"
+    }
+    catch {
+        return $false
+    }
+    if ([int]$result.StatusCode -notin @(301, 302, 303, 307, 308) -or
+        -not $result.Server -or
+        -not $result.CfRay -or
+        [string]::IsNullOrWhiteSpace([string]$result.Location)) {
+        return $false
+    }
+    $redirect = $null
+    if (-not [uri]::TryCreate([string]$result.Location, [UriKind]::Absolute, [ref]$redirect)) {
+        return $false
+    }
+    return $redirect.Scheme -eq 'https' -and
+        $redirect.AbsolutePath.StartsWith('/cdn-cgi/access/', [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-AiStackRunningServices {
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        return @()
+    }
+    try {
+        return @(
+            Invoke-DockerCompose `
+                -Arguments @('--profile', 'tunnel', 'ps', '--status', 'running', '--services') `
+                -Capture
+        )
+    }
+    catch {
+        return @()
+    }
+}
+
 function Initialize-CloudflareTunnel {
     [CmdletBinding()]
-    param()
+    param(
+        [string]$RestHostname,
+        [string]$ViewerHostname,
+        [string]$ConsoleHostname,
+        [switch]$DisableConsole
+    )
 
     Initialize-AiStackConfiguration
+    if ($DisableConsole -and -not [string]::IsNullOrWhiteSpace($ConsoleHostname)) {
+        throw 'ConsoleHostname and DisableConsole cannot be used together.'
+    }
+    $environment = [System.IO.File]::ReadAllText($script:EnvPath)
+    $originalEnvironment = $environment
+    $environmentChanged = $false
+    foreach ($requestedHostname in @(
+        @{ Parameter = 'RestHostname'; Environment = 'CLOUDFLARE_REST_HOSTNAME'; Value = $RestHostname }
+        @{ Parameter = 'ViewerHostname'; Environment = 'CLOUDFLARE_VIEWER_HOSTNAME'; Value = $ViewerHostname }
+        @{ Parameter = 'ConsoleHostname'; Environment = 'CLOUDFLARE_CONSOLE_HOSTNAME'; Value = $ConsoleHostname }
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace($requestedHostname.Value)) {
+            Assert-CloudflareHostname `
+                -Name $requestedHostname.Parameter `
+                -Hostname $requestedHostname.Value
+            $environment = Set-DotEnvValue `
+                -Content $environment `
+                -Name $requestedHostname.Environment `
+                -Value $requestedHostname.Value
+            $environmentChanged = $true
+        }
+    }
+    if ($DisableConsole) {
+        $environment = Set-DotEnvValue `
+            -Content $environment `
+            -Name 'CLOUDFLARE_CONSOLE_HOSTNAME' `
+            -Value 'memory-console.example.com'
+        $environmentChanged = $true
+    }
+    if ($environmentChanged) {
+        Write-Utf8NoBom -Path $script:EnvPath -Content $environment
+    }
     $values = Get-DotEnvValues -Path $script:EnvPath
     $tunnelName = if ($values.ContainsKey('CLOUDFLARE_TUNNEL_NAME')) {
         $values['CLOUDFLARE_TUNNEL_NAME']
@@ -637,6 +770,17 @@ function Initialize-CloudflareTunnel {
             $values[$name] -like '*.example.com') {
             throw "$name must be set to a real hostname in ~\.ai-stack\.env."
         }
+    }
+    $consoleHostnameValue = if ($values.ContainsKey('CLOUDFLARE_CONSOLE_HOSTNAME') -and
+        -not [string]::IsNullOrWhiteSpace($values['CLOUDFLARE_CONSOLE_HOSTNAME']) -and
+        $values['CLOUDFLARE_CONSOLE_HOSTNAME'] -notlike '*.example.com') {
+        $values['CLOUDFLARE_CONSOLE_HOSTNAME']
+    }
+    else {
+        ''
+    }
+    if ($consoleHostnameValue) {
+        Assert-CloudflareHostname -Name 'CLOUDFLARE_CONSOLE_HOSTNAME' -Hostname $consoleHostnameValue
     }
 
     $cloudflared = Get-CloudflaredCommand
@@ -680,22 +824,80 @@ function Initialize-CloudflareTunnel {
         $tunnelId = Get-CloudflareTunnelIdFromCredentials -Path $script:CloudflareCredentialsPath
     }
 
-    [void](New-CloudflareTunnelConfig `
+    $runningServices = @(Get-AiStackRunningServices)
+    $connectorWasRunning = $runningServices -contains 'cloudflared'
+    $existingConfig = if (Test-Path -LiteralPath $script:CloudflareConfigPath) {
+        [System.IO.File]::ReadAllText($script:CloudflareConfigPath)
+    }
+    else {
+        ''
+    }
+    $hadConsoleIngress = $consoleHostnameValue -and
+        $existingConfig -match "(?im)^\s*-\s*hostname:\s*$([regex]::Escape($consoleHostnameValue))\s*$"
+
+    $baseConfigChanged = New-CloudflareTunnelConfig `
         -TunnelId $tunnelId `
         -RestHostname $values['CLOUDFLARE_REST_HOSTNAME'] `
-        -ViewerHostname $values['CLOUDFLARE_VIEWER_HOSTNAME'])
+        -ViewerHostname $values['CLOUDFLARE_VIEWER_HOSTNAME']
 
     [void](Invoke-CloudflaredCommand -Command $cloudflared -Arguments @(
         'tunnel', '--config', $script:CloudflareConfigPath, 'ingress', 'validate'
     ))
-    foreach ($hostname in @($values['CLOUDFLARE_REST_HOSTNAME'], $values['CLOUDFLARE_VIEWER_HOSTNAME'])) {
+    foreach ($hostname in @(
+        $values['CLOUDFLARE_REST_HOSTNAME']
+        $values['CLOUDFLARE_VIEWER_HOSTNAME']
+        $consoleHostnameValue
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) {
         [void](Invoke-CloudflaredCommand -Command $cloudflared -Arguments @(
             'tunnel', '--origincert', $originCertificate, 'route', 'dns',
             '--overwrite-dns', $tunnelId, $hostname
         ))
     }
 
+    if ($consoleHostnameValue) {
+        if (-not (Test-CloudflareAccessProtection -Hostname $consoleHostnameValue)) {
+            Write-Utf8NoBom -Path $script:EnvPath -Content $originalEnvironment
+            if ([string]::IsNullOrEmpty($existingConfig)) {
+                Remove-Item -LiteralPath $script:CloudflareConfigPath -Force -ErrorAction SilentlyContinue
+            }
+            else {
+                Write-Utf8NoBom -Path $script:CloudflareConfigPath -Content $existingConfig
+            }
+            if ($hadConsoleIngress -and $connectorWasRunning) {
+                try {
+                    Invoke-DockerCompose -Arguments @('--profile', 'tunnel', 'stop', 'cloudflared')
+                }
+                catch {
+                    Write-Warning "Could not stop the existing Cloudflare connector: $($_.Exception.Message)"
+                }
+            }
+            throw "Cloudflare Access is not protecting https://$consoleHostnameValue. Ensure Cloudflare has issued a valid edge certificate (nested hostnames can require Total TLS or Advanced Certificate Manager), then create a Self-hosted Access application for the entire hostname with an identity allow policy and rerun configure-tunnel. The console origin route was not published."
+        }
+
+        [void](New-CloudflareTunnelConfig `
+            -TunnelId $tunnelId `
+            -RestHostname $values['CLOUDFLARE_REST_HOSTNAME'] `
+            -ViewerHostname $values['CLOUDFLARE_VIEWER_HOSTNAME'] `
+            -ConsoleHostname $consoleHostnameValue)
+        [void](Invoke-CloudflaredCommand -Command $cloudflared -Arguments @(
+            'tunnel', '--config', $script:CloudflareConfigPath, 'ingress', 'validate'
+        ))
+        if ($connectorWasRunning) {
+            Invoke-DockerCompose -Arguments @(
+                '--profile', 'tunnel', 'up', '-d', '--no-deps', '--force-recreate', 'cloudflared'
+            )
+        }
+    }
+    elseif ($baseConfigChanged -and $connectorWasRunning) {
+        Invoke-DockerCompose -Arguments @(
+            '--profile', 'tunnel', 'up', '-d', '--no-deps', '--force-recreate', 'cloudflared'
+        )
+    }
+
     Write-Host "Cloudflare tunnel '$tunnelName' is configured from $script:CloudflareConfigPath."
+    if ($consoleHostnameValue) {
+        Write-Host "Authenticated iii Console: https://$consoleHostnameValue"
+    }
     Write-Host 'Run .\ai-stack.ps1 start -Tunnel to launch its Docker-managed connector.'
 }
 

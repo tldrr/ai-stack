@@ -197,6 +197,7 @@ try {
         Assert-True ($envBefore -match '(?m)^AGENTMEMORY_CONSOLE_PORT=3114\r?$') 'Setup did not upgrade an existing environment with the Console port.'
         Assert-True ($envBefore -match '(?m)^AGENTMEMORY_INJECT_CONTEXT=true\r?$') 'Setup did not enable context injection for an existing environment.'
         Assert-True ($envBefore -match '(?m)^AGENTMEMORY_AUTO_COMPRESS=false\r?$') 'Setup did not keep per-observation auto-compression disabled.'
+        Assert-True ($envBefore -match '(?m)^CLOUDFLARE_CONSOLE_HOSTNAME=memory-console\.example\.com\r?$') 'Setup did not add the optional console hostname.'
         $updatedCopilot = [System.IO.File]::ReadAllText($copilotConfig) | ConvertFrom-Json
         Assert-Equal (Join-Path $testDataPath 'agentmemory-mcp.ps1') $updatedCopilot.mcpServers.agentmemory.args[-1] 'Copilot retained the legacy launcher path.'
         Assert-True ([System.IO.File]::ReadAllText($codexConfig) -match [regex]::Escape($testDataPath.Replace('\', '\\'))) 'Codex retained the legacy launcher path.'
@@ -214,18 +215,28 @@ try {
             -TunnelId $tunnelId `
             -RestHostname 'memory-api.example.com' `
             -ViewerHostname 'memory.example.com' `
+            -ConsoleHostname 'memory-console.example.com' `
             -Path $configPath)
         $first = [System.IO.File]::ReadAllText($configPath)
         Assert-True (-not (New-CloudflareTunnelConfig `
             -TunnelId $tunnelId `
             -RestHostname 'memory-api.example.com' `
             -ViewerHostname 'memory.example.com' `
+            -ConsoleHostname 'memory-console.example.com' `
             -Path $configPath)) 'Second config generation reported a change.'
         Assert-Equal $first ([System.IO.File]::ReadAllText($configPath))
         Assert-True ($first -match 'credentials-file: /etc/cloudflared/credentials\.json') 'Container credential path is missing.'
         Assert-True ($first -match 'service: http://agentmemory:3111') 'REST ingress is missing.'
         Assert-True ($first -match 'service: http://agentmemory:3113') 'Viewer ingress is missing.'
+        Assert-True ($first -match 'service: http://iii-console:3114') 'Console ingress is missing.'
         Assert-True ($first -match '(?m)^  - service: http_status:404\r?$') 'Catch-all ingress is missing.'
+        $withoutConsolePath = Join-Path $testDataPath 'cloudflared\without-console.yml'
+        [void](New-CloudflareTunnelConfig `
+            -TunnelId $tunnelId `
+            -RestHostname 'memory-api.example.com' `
+            -ViewerHostname 'memory.example.com' `
+            -Path $withoutConsolePath)
+        Assert-True ([System.IO.File]::ReadAllText($withoutConsolePath) -notmatch 'iii-console') 'Disabled console ingress was still generated.'
 
         $failed = $false
         try {
@@ -239,6 +250,61 @@ try {
             $failed = $true
         }
         Assert-True $failed 'Invalid hostnames were accepted.'
+    }
+
+    Invoke-Test 'Cloudflare console route requires a real Access challenge' {
+        $module = Get-Module AiStack
+        $protected = & $module {
+            Test-CloudflareAccessProtection `
+                -Hostname 'memory-console.example.com' `
+                -Probe {
+                    param($uri)
+                    [pscustomobject]@{
+                        StatusCode = 302
+                        Location = 'https://team.cloudflareaccess.com/cdn-cgi/access/login/memory-console.example.com'
+                        Server = $true
+                        CfRay = $true
+                    }
+                }
+        }
+        $unprotected = & $module {
+            Test-CloudflareAccessProtection `
+                -Hostname 'memory-console.example.com' `
+                -Probe {
+                    param($uri)
+                    [pscustomobject]@{
+                        StatusCode = 200
+                        Location = ''
+                        Server = $true
+                        CfRay = $true
+                    }
+                }
+        }
+        $originRedirect = & $module {
+            Test-CloudflareAccessProtection `
+                -Hostname 'memory-console.example.com' `
+                -Probe {
+                    param($uri)
+                    [pscustomobject]@{
+                        StatusCode = 302
+                        Location = 'https://attacker.example.net/cdn-cgi/access/login/fake'
+                        Server = $false
+                        CfRay = $false
+                    }
+                }
+        }
+        $failedProbe = & $module {
+            Test-CloudflareAccessProtection `
+                -Hostname 'memory-console.example.com' `
+                -Probe {
+                    param($uri)
+                    throw 'DNS or TLS unavailable'
+                }
+        }
+        Assert-True $protected 'A valid Cloudflare Access challenge was rejected.'
+        Assert-True (-not $unprotected) 'An unprotected console response was accepted.'
+        Assert-True (-not $originRedirect) 'A non-Cloudflare redirect was accepted as Access protection.'
+        Assert-True (-not $failedProbe) 'A failed DNS/TLS probe was accepted as Access protection.'
     }
 
     Invoke-Test 'Empty Cloudflare tunnel lists are handled' {
@@ -268,6 +334,10 @@ try {
         Assert-True ($compose -match '/etc/cloudflared/config\.yml') 'Cloudflare config file is not used.'
         Assert-True ($compose -notmatch 'CLOUDFLARE_TUNNEL_TOKEN') 'Compose still depends on a remotely managed tunnel token.'
         Assert-True ($envExample -notmatch 'CLOUDFLARE_TUNNEL_TOKEN') '.env.example still requests a tunnel token.'
+        Assert-True ($module -match 'Test-CloudflareAccessProtection') 'Console ingress is not gated by Cloudflare Access.'
+        Assert-True ($module -match 'The console origin route was not published') 'Unsafe console publication does not fail closed.'
+        Assert-True ($module -match 'Write-Utf8NoBom -Path \$script:EnvPath -Content \$originalEnvironment') 'Failed Access preflight does not restore the previous environment.'
+        Assert-True ($module -match 'DisableConsole') 'A previously published console cannot be disabled explicitly.'
         Assert-True ($module -match "Invoke-DockerCompose -Arguments @\('--profile', 'tunnel', 'down'\)") 'Stop does not include the tunnel profile.'
         Assert-True ($module -match "\$arguments = @\('--profile', 'tunnel', 'down', '--remove-orphans'\)") 'Uninstall does not include the tunnel profile.'
         Assert-True ($module -match "\$arguments = @\('up', '-d', '--build'\)") 'Restart does not rebuild and recreate services when Compose configuration changes.'

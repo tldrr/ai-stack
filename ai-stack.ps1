@@ -16,6 +16,11 @@ param(
     [ValidateSet('All', 'Hermes', 'Pi', 'Copilot', 'VSCode')]
     [string]$Source = 'All',
 
+    [string]$RestHostname,
+    [string]$ViewerHostname,
+    [string]$ConsoleHostname,
+
+    [switch]$DisableConsole,
     [switch]$Tunnel,
     [switch]$DryRun,
     [switch]$DeleteData,
@@ -33,7 +38,7 @@ ai-stack management
 
   .\ai-stack.ps1 setup
   .\ai-stack.ps1 configure [-NoOpen]
-  .\ai-stack.ps1 configure-tunnel
+  .\ai-stack.ps1 configure-tunnel [-RestHostname api.mem.example.com] [-ViewerHostname mem.example.com] [-ConsoleHostname iii.mem.example.com] [-DisableConsole]
   .\ai-stack.ps1 start [-Tunnel]
   .\ai-stack.ps1 stop
   .\ai-stack.ps1 restart
@@ -58,7 +63,11 @@ ai-stack management
         Write-Host "Configuration: $envPath"
     }
     'configure-tunnel' {
-        Initialize-CloudflareTunnel
+        Initialize-CloudflareTunnel `
+            -RestHostname $RestHostname `
+            -ViewerHostname $ViewerHostname `
+            -ConsoleHostname $ConsoleHostname `
+            -DisableConsole:$DisableConsole
     }
     'start' {
         Start-AiStack -Tunnel:$Tunnel
