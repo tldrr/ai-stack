@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('help', 'setup', 'configure', 'start', 'stop', 'restart', 'status', 'doctor', 'logs', 'install-clients', 'uninstall')]
+    [ValidateSet('help', 'setup', 'configure', 'configure-tunnel', 'start', 'stop', 'restart', 'status', 'doctor', 'logs', 'install-clients', 'uninstall')]
     [string]$Command = 'help',
 
     [ValidateSet('All', 'Copilot', 'Codex')]
@@ -26,6 +26,7 @@ ai-stack management
 
   .\ai-stack.ps1 setup
   .\ai-stack.ps1 configure [-NoOpen]
+  .\ai-stack.ps1 configure-tunnel
   .\ai-stack.ps1 start [-Tunnel]
   .\ai-stack.ps1 stop
   .\ai-stack.ps1 restart
@@ -45,6 +46,9 @@ ai-stack management
             Start-Process notepad.exe -ArgumentList @($envPath)
         }
         Write-Host "Configuration: $envPath"
+    }
+    'configure-tunnel' {
+        Initialize-CloudflareTunnel
     }
     'start' {
         Start-AiStack -Tunnel:$Tunnel

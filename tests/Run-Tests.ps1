@@ -94,6 +94,49 @@ try {
         Assert-True ($secretBefore -match '^am_[0-9a-f]{64}$') 'AgentMemory secret has the wrong format.'
     }
 
+    Invoke-Test 'Cloudflare config generation is safe and idempotent' {
+        $configPath = Join-Path $tempRoot '.state\cloudflared\config.yml'
+        $tunnelId = '245b35f7-4ee8-4d7f-a39a-5ad80c128f51'
+        Assert-True (New-CloudflareTunnelConfig `
+            -TunnelId $tunnelId `
+            -RestHostname 'memory-api.example.com' `
+            -ViewerHostname 'memory.example.com' `
+            -Path $configPath)
+        $first = [System.IO.File]::ReadAllText($configPath)
+        Assert-True (-not (New-CloudflareTunnelConfig `
+            -TunnelId $tunnelId `
+            -RestHostname 'memory-api.example.com' `
+            -ViewerHostname 'memory.example.com' `
+            -Path $configPath)) 'Second config generation reported a change.'
+        Assert-Equal $first ([System.IO.File]::ReadAllText($configPath))
+        Assert-True ($first -match 'credentials-file: /etc/cloudflared/credentials\.json') 'Container credential path is missing.'
+        Assert-True ($first -match 'service: http://agentmemory:3111') 'REST ingress is missing.'
+        Assert-True ($first -match 'service: http://agentmemory:3113') 'Viewer ingress is missing.'
+        Assert-True ($first -match '(?m)^  - service: http_status:404\r?$') 'Catch-all ingress is missing.'
+
+        $failed = $false
+        try {
+            [void](New-CloudflareTunnelConfig `
+                -TunnelId $tunnelId `
+                -RestHostname 'bad hostname' `
+                -ViewerHostname 'memory.example.com' `
+                -Path $configPath)
+        }
+        catch {
+            $failed = $true
+        }
+        Assert-True $failed 'Invalid hostnames were accepted.'
+    }
+
+    Invoke-Test 'Compose uses local Cloudflare config without a token' {
+        $compose = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'compose.yaml'))
+        $envExample = [System.IO.File]::ReadAllText((Join-Path $repoRoot '.env.example'))
+        Assert-True ($compose -match '\.state/cloudflared:/etc/cloudflared:ro') 'Cloudflare state is not mounted read-only.'
+        Assert-True ($compose -match '/etc/cloudflared/config\.yml') 'Cloudflare config file is not used.'
+        Assert-True ($compose -notmatch 'CLOUDFLARE_TUNNEL_TOKEN') 'Compose still depends on a remotely managed tunnel token.'
+        Assert-True ($envExample -notmatch 'CLOUDFLARE_TUNNEL_TOKEN') '.env.example still requests a tunnel token.'
+    }
+
     Invoke-Test 'Copilot JSON merge preserves servers and is idempotent' {
         $copilotPath = Join-Path $tempRoot 'copilot\mcp-config.json'
         New-Item -ItemType Directory -Path (Split-Path $copilotPath -Parent) | Out-Null

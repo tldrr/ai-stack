@@ -77,6 +77,7 @@ Host ports are configurable in `.env`; every published port remains bound to
 | --- | --- |
 | `setup` | Creates `.env`, generates local secrets, and writes the MCP launcher |
 | `configure` | Runs setup and opens the git-ignored `.env` in Notepad |
+| `configure-tunnel` | Creates a locally managed tunnel, DNS routes, credentials, and config file |
 | `start [-Tunnel]` | Builds and starts the stack, optionally including Cloudflare |
 | `stop` | Stops containers without deleting credentials or memories |
 | `restart` | Restarts running services |
@@ -149,25 +150,46 @@ Streamable HTTP MCP server.
 
 ## Optional Cloudflare Tunnel
 
-Create a remotely managed Cloudflare Tunnel, then configure two public
-hostnames in the Cloudflare dashboard:
+This stack uses a **locally managed** named tunnel. The route definition is a
+generated config file, not dashboard state:
 
-| Public hostname | Tunnel service |
+| `.env` hostname | Config-file service |
 | --- | --- |
 | `CLOUDFLARE_REST_HOSTNAME` | `http://agentmemory:3111` |
 | `CLOUDFLARE_VIEWER_HOSTNAME` | `http://agentmemory:3113` |
 
-Put the tunnel token and the two matching hostnames in `.env`, then run:
+Install `cloudflared`, set `CLOUDFLARE_TUNNEL_NAME` and both hostnames in
+`.env`, then run:
 
 ```powershell
+.\ai-stack.ps1 configure-tunnel
 .\ai-stack.ps1 start -Tunnel
 ```
 
+The first configuration opens Cloudflare's browser authorization once. The
+command then creates or reuses local credentials, writes
+`.state\cloudflared\config.yml`, validates its ingress rules, and idempotently
+creates both DNS routes. Tunnel credentials remain in the git-ignored
+`.state\cloudflared\credentials.json`. Docker mounts this directory read-only,
+and `restart: unless-stopped` provides autostart with Docker Desktop.
+
 The profile is opt-in and does not publish LiteLLM. Apply Cloudflare Access to
-the viewer hostname so the HTML surface is identity-gated. AgentMemory also
-requires its bearer secret for viewer API calls. Keep AgentMemory bearer
-authentication on the REST hostname; if Cloudflare Access is added there,
-non-browser clients also need an Access service token.
+the viewer hostname so the HTML surface is identity-gated. Access policies are
+Cloudflare account control-plane resources and are not part of the
+`cloudflared` ingress file; manage them separately with Cloudflare Access or
+Terraform. AgentMemory also requires its bearer secret for viewer API calls.
+Keep AgentMemory bearer authentication on the REST hostname; if Cloudflare
+Access is added there, non-browser clients also need an Access service token.
+
+No extra MCP or streaming route is required. The official MCP shim is a local
+stdio process that calls the exposed AgentMemory REST API. Port `3112` is iii's
+internal worker stream and must remain unexposed. A future remote ChatGPT MCP
+would need a separate Streamable HTTP endpoint plus OAuth 2.1; this tunnel does
+not provide either.
+
+Do not also run a token-installed Windows `Cloudflared` service for this stack.
+After the Docker-managed connector is healthy, remove the old service from an
+elevated terminal with `cloudflared service uninstall`.
 
 The tunnel only exposes AgentMemory REST and its viewer. It does not make
 AgentMemory compatible with ChatGPT remote MCP and must not be configured as a
@@ -175,8 +197,8 @@ ChatGPT connector.
 
 ## Security boundaries
 
-- `.env`, `.state/`, generated launchers, bearer secrets, and backups are
-  git-ignored.
+- `.env`, `.state/`, generated launchers, bearer secrets, tunnel credentials,
+  and backups are git-ignored.
 - The AgentMemory bearer is mounted as a Docker secret and copied to
   `/data/.hmac`; it is not present in Compose environment metadata or logs.
 - Container shutdown forwards termination to AgentMemory and its detached iii
@@ -207,6 +229,7 @@ docker run --rm -v ai-stack_agentmemory-data:/data -v "${PWD}\backups:/backup" a
 docker run --rm -v ai-stack_github-copilot-token:/data -v "${PWD}\backups:/backup" alpine:3.22 tar czf /backup/copilot-token.tgz -C /data .
 Copy-Item .env backups\ai-stack.env
 Copy-Item .state\agentmemory-secret backups\agentmemory-secret
+if (Test-Path .state\cloudflared) { Copy-Item .state\cloudflared backups\cloudflared -Recurse }
 ```
 
 Restore into stopped, empty volumes:
@@ -220,10 +243,13 @@ docker run --rm -v ai-stack_github-copilot-token:/data -v "${PWD}\backups:/backu
 Copy-Item backups\ai-stack.env .env
 New-Item -ItemType Directory -Force .state | Out-Null
 Copy-Item backups\agentmemory-secret .state\agentmemory-secret
+if (Test-Path backups\cloudflared) { Copy-Item backups\cloudflared .state\cloudflared -Recurse }
 .\ai-stack.ps1 start
 ```
 
 Backups contain credentials and private memories. Encrypt and protect them.
+Tunnel credentials cannot be downloaded again; restoring their directory is
+required to reconnect the same locally managed tunnel.
 
 ## Updates
 
@@ -259,6 +285,11 @@ MCP launcher remains present, restart the stack, then restart clients.
 **Viewer returns a host or auth error:** ensure the local/public hostname
 matches `.env`, restart AgentMemory, and enter the bearer from the local
 `.state/agentmemory-secret` only in the trusted viewer prompt.
+
+**Tunnel profile reports a missing config:** run `configure-tunnel`. If the
+named tunnel already exists but `.state\cloudflared\credentials.json` is
+missing, restore that credential from backup or choose a new tunnel name;
+Cloudflare does not allow downloading a locally managed tunnel secret again.
 
 **Docker Desktop cannot reach the Internet:** verify WSL2 mirrored networking,
 VPN/proxy settings, and Docker Desktop DNS. Service-to-service traffic should

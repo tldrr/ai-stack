@@ -13,6 +13,9 @@ $script:ComposePath = Join-Path $script:Root 'compose.yaml'
 $script:StatePath = Join-Path $script:Root '.state'
 $script:McpLauncherPath = Join-Path $script:StatePath 'agentmemory-mcp.ps1'
 $script:AgentMemorySecretPath = Join-Path $script:StatePath 'agentmemory-secret'
+$script:CloudflareStatePath = Join-Path $script:StatePath 'cloudflared'
+$script:CloudflareConfigPath = Join-Path $script:CloudflareStatePath 'config.yml'
+$script:CloudflareCredentialsPath = Join-Path $script:CloudflareStatePath 'credentials.json'
 
 function Write-Utf8NoBom {
     param(
@@ -191,12 +194,219 @@ function Invoke-DockerCompose {
     }
 }
 
-function Assert-TunnelConfigured {
-    $values = Get-DotEnvValues -Path $script:EnvPath
-    if (-not $values.ContainsKey('CLOUDFLARE_TUNNEL_TOKEN') -or
-        [string]::IsNullOrWhiteSpace($values['CLOUDFLARE_TUNNEL_TOKEN'])) {
-        throw 'CLOUDFLARE_TUNNEL_TOKEN must be set in .env before starting the tunnel profile.'
+function Assert-CloudflareHostname {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][string]$Hostname
+    )
+
+    $pattern = '^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$'
+    if ($Hostname -notmatch $pattern) {
+        throw "$Name must be a valid fully qualified hostname."
     }
+}
+
+function New-CloudflareTunnelConfig {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$TunnelId,
+        [Parameter(Mandatory = $true)][string]$RestHostname,
+        [Parameter(Mandatory = $true)][string]$ViewerHostname,
+        [string]$Path = $script:CloudflareConfigPath
+    )
+
+    $parsedTunnelId = [guid]::Empty
+    if (-not [guid]::TryParse($TunnelId, [ref]$parsedTunnelId)) {
+        throw 'TunnelId must be a valid UUID.'
+    }
+    Assert-CloudflareHostname -Name 'CLOUDFLARE_REST_HOSTNAME' -Hostname $RestHostname
+    Assert-CloudflareHostname -Name 'CLOUDFLARE_VIEWER_HOSTNAME' -Hostname $ViewerHostname
+    if ($RestHostname -ieq $ViewerHostname) {
+        throw 'Cloudflare REST and viewer hostnames must be different.'
+    }
+
+    $content = @"
+tunnel: $($parsedTunnelId.ToString())
+credentials-file: /etc/cloudflared/credentials.json
+
+ingress:
+  - hostname: $RestHostname
+    service: http://agentmemory:3111
+  - hostname: $ViewerHostname
+    service: http://agentmemory:3113
+  - service: http_status:404
+"@ + [Environment]::NewLine
+
+    $directory = Split-Path $Path -Parent
+    if (-not (Test-Path -LiteralPath $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    $existing = if (Test-Path -LiteralPath $Path) {
+        [System.IO.File]::ReadAllText($Path)
+    }
+    else {
+        ''
+    }
+    if ($existing -eq $content) {
+        return $false
+    }
+    Write-Utf8NoBom -Path $Path -Content $content
+    return $true
+}
+
+function Get-CloudflaredCommand {
+    foreach ($name in @('cloudflared.exe', 'cloudflared')) {
+        $command = Get-Command $name -ErrorAction SilentlyContinue
+        if ($command) {
+            return $command.Source
+        }
+    }
+    throw 'cloudflared was not found on PATH. Install the pinned or current stable Cloudflare Tunnel client first.'
+}
+
+function Invoke-CloudflaredCommand {
+    param(
+        [Parameter(Mandatory = $true)][string]$Command,
+        [Parameter(Mandatory = $true)][string[]]$Arguments
+    )
+
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        # Windows PowerShell 5.1 wraps native stderr as ErrorRecord objects.
+        # cloudflared writes normal login instructions and progress there.
+        $ErrorActionPreference = 'Continue'
+        $output = & $Command @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+    }
+    $global:LASTEXITCODE = 0
+    if ($exitCode -ne 0) {
+        throw "cloudflared failed: $($output -join [Environment]::NewLine)"
+    }
+    return @($output)
+}
+
+function Get-CloudflareOriginCertificatePath {
+    if (-not [string]::IsNullOrWhiteSpace($env:TUNNEL_ORIGIN_CERT) -and
+        (Test-Path -LiteralPath $env:TUNNEL_ORIGIN_CERT)) {
+        return [System.IO.Path]::GetFullPath($env:TUNNEL_ORIGIN_CERT)
+    }
+    $candidate = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.cloudflared\cert.pem'
+    if (Test-Path -LiteralPath $candidate) {
+        return $candidate
+    }
+    return $null
+}
+
+function Get-CloudflareTunnelIdFromCredentials {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    try {
+        $credentials = [System.IO.File]::ReadAllText($Path) | ConvertFrom-Json
+    }
+    catch {
+        throw "Cannot read Cloudflare tunnel credentials at '$Path': $($_.Exception.Message)"
+    }
+    $tunnelId = [string]$credentials.TunnelID
+    $parsedTunnelId = [guid]::Empty
+    if (-not [guid]::TryParse($tunnelId, [ref]$parsedTunnelId)) {
+        throw "Cloudflare credentials at '$Path' do not contain a valid TunnelID."
+    }
+    return $parsedTunnelId.ToString()
+}
+
+function Initialize-CloudflareTunnel {
+    [CmdletBinding()]
+    param()
+
+    Initialize-AiStackConfiguration
+    $values = Get-DotEnvValues -Path $script:EnvPath
+    $tunnelName = if ($values.ContainsKey('CLOUDFLARE_TUNNEL_NAME')) {
+        $values['CLOUDFLARE_TUNNEL_NAME']
+    }
+    else {
+        'ai-stack'
+    }
+    if ($tunnelName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$') {
+        throw 'CLOUDFLARE_TUNNEL_NAME contains unsupported characters.'
+    }
+    foreach ($name in @('CLOUDFLARE_REST_HOSTNAME', 'CLOUDFLARE_VIEWER_HOSTNAME')) {
+        if (-not $values.ContainsKey($name) -or [string]::IsNullOrWhiteSpace($values[$name]) -or
+            $values[$name] -like '*.example.com') {
+            throw "$name must be set to a real hostname in .env."
+        }
+    }
+
+    $cloudflared = Get-CloudflaredCommand
+    $originCertificate = Get-CloudflareOriginCertificatePath
+    if (-not $originCertificate) {
+        Write-Host 'Cloudflare authorization is required once. Complete the browser flow that opens.'
+        [void](Invoke-CloudflaredCommand -Command $cloudflared -Arguments @('tunnel', 'login'))
+        $originCertificate = Get-CloudflareOriginCertificatePath
+        if (-not $originCertificate) {
+            throw 'Cloudflare login completed without creating ~/.cloudflared/cert.pem.'
+        }
+    }
+
+    if (-not (Test-Path -LiteralPath $script:CloudflareStatePath)) {
+        New-Item -ItemType Directory -Path $script:CloudflareStatePath -Force | Out-Null
+    }
+
+    if (Test-Path -LiteralPath $script:CloudflareCredentialsPath) {
+        $tunnelId = Get-CloudflareTunnelIdFromCredentials -Path $script:CloudflareCredentialsPath
+    }
+    else {
+        $listOutput = Invoke-CloudflaredCommand -Command $cloudflared -Arguments @(
+            'tunnel', '--origincert', $originCertificate, 'list', '--output', 'json'
+        )
+        try {
+            $tunnels = @(($listOutput -join [Environment]::NewLine) | ConvertFrom-Json)
+        }
+        catch {
+            throw "cloudflared returned invalid tunnel list JSON: $($_.Exception.Message)"
+        }
+        $matchingTunnels = @($tunnels | Where-Object { $_.name -eq $tunnelName })
+        if ($matchingTunnels.Count -gt 0) {
+            throw "Tunnel '$tunnelName' already exists but its local credentials are missing. Restore .state\cloudflared\credentials.json or choose a different CLOUDFLARE_TUNNEL_NAME."
+        }
+
+        [void](Invoke-CloudflaredCommand -Command $cloudflared -Arguments @(
+            'tunnel', '--origincert', $originCertificate, 'create',
+            '--credentials-file', $script:CloudflareCredentialsPath,
+            '--output', 'json', $tunnelName
+        ))
+        $tunnelId = Get-CloudflareTunnelIdFromCredentials -Path $script:CloudflareCredentialsPath
+    }
+
+    [void](New-CloudflareTunnelConfig `
+        -TunnelId $tunnelId `
+        -RestHostname $values['CLOUDFLARE_REST_HOSTNAME'] `
+        -ViewerHostname $values['CLOUDFLARE_VIEWER_HOSTNAME'])
+
+    [void](Invoke-CloudflaredCommand -Command $cloudflared -Arguments @(
+        'tunnel', '--config', $script:CloudflareConfigPath, 'ingress', 'validate'
+    ))
+    foreach ($hostname in @($values['CLOUDFLARE_REST_HOSTNAME'], $values['CLOUDFLARE_VIEWER_HOSTNAME'])) {
+        [void](Invoke-CloudflaredCommand -Command $cloudflared -Arguments @(
+            'tunnel', '--origincert', $originCertificate, 'route', 'dns',
+            '--overwrite-dns', $tunnelId, $hostname
+        ))
+    }
+
+    Write-Host "Cloudflare tunnel '$tunnelName' is configured from $script:CloudflareConfigPath."
+    Write-Host 'Run .\ai-stack.ps1 start -Tunnel to launch its Docker-managed connector.'
+}
+
+function Assert-TunnelConfigured {
+    foreach ($path in @($script:CloudflareConfigPath, $script:CloudflareCredentialsPath)) {
+        if (-not (Test-Path -LiteralPath $path) -or
+            [string]::IsNullOrWhiteSpace([System.IO.File]::ReadAllText($path))) {
+            throw 'The local Cloudflare tunnel is not configured. Run .\ai-stack.ps1 configure-tunnel first.'
+        }
+    }
+    [void](Get-CloudflareTunnelIdFromCredentials -Path $script:CloudflareCredentialsPath)
 }
 
 function Assert-AiStackEnvExists {
@@ -532,6 +742,8 @@ function Uninstall-AiStack {
 Export-ModuleMember -Function @(
     'Get-DotEnvValues',
     'Initialize-AiStackConfiguration',
+    'New-CloudflareTunnelConfig',
+    'Initialize-CloudflareTunnel',
     'Merge-CopilotMcpConfig',
     'Merge-CodexMcpConfig',
     'Invoke-AiStackDoctor',

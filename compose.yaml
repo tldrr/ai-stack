@@ -80,10 +80,12 @@ services:
     restart: unless-stopped
     command:
       - tunnel
+      - --config
+      - /etc/cloudflared/config.yml
       - --no-autoupdate
       - run
-      - --token
-      - ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    volumes:
+      - ./.state/cloudflared:/etc/cloudflared:ro
     depends_on:
       agentmemory:
         condition: service_healthy
