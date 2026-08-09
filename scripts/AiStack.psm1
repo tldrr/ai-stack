@@ -272,8 +272,8 @@ function Invoke-CloudflaredCommand {
 
     $previousErrorAction = $ErrorActionPreference
     try {
-        # Windows PowerShell 5.1 wraps native stderr as ErrorRecord objects.
-        # cloudflared writes normal login instructions and progress there.
+        # Windows PowerShell 5.1 wraps native stderr as ErrorRecord objects,
+        # while cloudflared writes normal diagnostics there.
         $ErrorActionPreference = 'Continue'
         $output = & $Command @Arguments 2>&1
         $exitCode = $LASTEXITCODE

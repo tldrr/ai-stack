@@ -166,8 +166,11 @@ Install `cloudflared`, set `CLOUDFLARE_TUNNEL_NAME` and both hostnames in
 .\ai-stack.ps1 start -Tunnel
 ```
 
-The first configuration opens Cloudflare's browser authorization once. The
-command then creates or reuses local credentials, writes
+On the first run, `cloudflared` opens one browser authorization. It uses that
+login to create the named tunnel, generate tunnel-specific credentials, and
+create both DNS records; there is no API-token creation or secret copy/paste.
+Later runs reuse the local authorization and tunnel credentials. The command
+writes
 `.state\cloudflared\config.yml`, validates its ingress rules, and idempotently
 creates both DNS routes. Tunnel credentials remain in the git-ignored
 `.state\cloudflared\credentials.json`. Docker mounts this directory read-only,
