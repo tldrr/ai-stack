@@ -93,9 +93,10 @@ ACL-restricted `%USERPROFILE%\.ai-stack` directory, independent of the clone.
 | `stop` | Stops containers without deleting credentials or memories |
 | `restart` | Reconciles Compose configuration and recreates changed services |
 | `status` | Shows Compose service state |
-| `doctor` | Checks Docker, local config, Node, and health endpoints |
+| `doctor` | Checks Docker, local config, Node, health endpoints, and capture integrations |
 | `logs [-Service ...]` | Follows redacted-by-design service logs |
 | `install-clients` | Merges MCP config and installs official upstream plugins |
+| `install-capture [-Agent ...]` | Installs official live-capture integrations for Copilot, pi, and Hermes |
 | `import-sessions [-Source ...] [-DryRun]` | Backfills supported local conversation histories into AgentMemory |
 | `enrich-sessions [-Source ...] [-DryRun]` | Resumably summarizes imports, builds graph batches, and consolidates memory |
 | `uninstall` | Removes containers/network but preserves `~\.ai-stack` |
@@ -177,6 +178,46 @@ workaround modifies global hooks and is not run automatically by ai-stack.
 This is a **local MCP** design: the desktop/CLI launches a stdio process, and
 that process calls AgentMemory REST on localhost. It is not a public,
 Streamable HTTP MCP server.
+
+## Continuous capture
+
+Install automatic capture after the stack is running:
+
+```powershell
+.\ai-stack.ps1 install-capture
+# Or select one integration:
+.\ai-stack.ps1 install-capture -Agent Pi
+```
+
+The installer downloads the official AgentMemory integrations from pinned
+upstream commit `d60652a7058773fa9428fa720eda38942f12f014`, verifies downloaded
+files against pinned SHA-256 or Git blob manifests, and creates timestamped
+backups before changing existing files.
+
+| Agent | Integration | Installed behavior |
+| --- | --- | --- |
+| Copilot CLI/app | Official AgentMemory plugin plus local MCP shim | Hooks capture new conversations; MCP exposes recall and memory tools |
+| pi | Official native TypeScript extension in each detected Windows/WSL pi profile | Recalls context before a turn and captures the completed conversation |
+| Hermes | Official native memory provider under `$HERMES_HOME\plugins\agentmemory` (or `%LOCALAPPDATA%\hermes` by default) | Prefetches relevant memory and syncs turns/session completion |
+
+Copilot, Hermes, and pi read the local URL and bearer from
+`%USERPROFILE%\.agentmemory\.env`; WSL pi receives the equivalent file beneath
+its Linux home with mode `0600`. The installer generates these local,
+gitignored files from `~\.ai-stack\agentmemory-secret`; it never writes the
+bearer into a plugin source file or agent configuration. Copilot's official
+hooks are routed through a generated dotenv runner because hook subprocesses do
+not inherit the MCP launcher's environment. Hermes'
+`memory.provider` key is merged without replacing unrelated YAML. pi relies on
+its normal `~/.pi/agent/extensions` auto-discovery, so existing settings are not
+rewritten. The pinned Hermes provider receives a one-line Windows compatibility
+adaptation so its upstream dotenv loader uses Python's resolved home when
+`$HOME` is unset.
+
+Restart each installed agent after installation. Copilot app can require a
+one-time plugin trust action in its UI. Capture stores source observations
+immediately; AgentMemory's enabled consolidation and graph workflows process
+them according to the upstream lifecycle. Historical import remains available
+for clients without hooks and for reconciling older sessions.
 
 ## Historical session import
 
@@ -398,6 +439,13 @@ batches are skipped.
 small local mode if `http://localhost:3111/agentmemory/livez` is unreachable.
 Run `doctor`; with the stack reachable, `AGENTMEMORY_TOOLS=all` exposes the full
 REST-backed tool set.
+
+**New conversations are not captured:** rerun `install-capture -Agent <name>`
+after an agent update, then fully restart that agent. For pi, confirm its active
+profile is under Windows or a running non-Docker WSL distribution. For Hermes,
+confirm `memory.provider: agentmemory` remains selected in its config. Do not
+paste the bearer into plugin files; rerunning the installer safely recreates the
+protected local environment file.
 
 **Custom ports do not work:** rerun `setup` after editing `~\.ai-stack\.env` so the local
 MCP launcher remains present, restart the stack, then restart clients.

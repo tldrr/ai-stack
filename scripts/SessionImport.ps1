@@ -37,7 +37,7 @@ function Protect-AiStackImportText {
         return ''
     }
 
-    $safe = $Text.Replace("`0", '')
+    $safe = [regex]::Replace($Text, "`0", '')
     $safe = [regex]::Replace(
         $safe,
         '(?is)-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----',
@@ -309,7 +309,7 @@ function Get-WslPiSessionRoots {
 
     $roots = New-Object System.Collections.ArrayList
     $distributions = @($listResult.Output | ForEach-Object {
-        ([string]$_).Replace("`0", '').Trim()
+        ([regex]::Replace([string]$_, "`0", '')).Trim()
     } | Where-Object {
         $_ -and $_ -notmatch '^docker-desktop' -and $_ -notmatch '[\\/:*?"<>|]'
     } | Select-Object -Unique)
@@ -318,14 +318,14 @@ function Get-WslPiSessionRoots {
             -Command $wsl.Source `
             -Arguments @(
                 '--distribution', $distribution, '--', 'sh', '-c',
-                'printf "__AI_STACK_HOME__%s\n" "$HOME"'
+                'printf "__AI_STACK_HOME__%s" "$HOME"'
             )
         if ($homeResult.ExitCode -ne 0) {
             Write-Warning "Cannot resolve the home directory for WSL distribution '$distribution'; skipping it."
             continue
         }
         $homeLine = @($homeResult.Output | ForEach-Object {
-            ([string]$_).Replace("`0", '').Trim()
+            ([regex]::Replace([string]$_, "`0", '')).Trim()
         } | Where-Object {
             $_ -match '^__AI_STACK_HOME__/'
         } | Select-Object -Last 1)

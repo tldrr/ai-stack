@@ -1133,6 +1133,10 @@ function Invoke-AiStackDoctor {
         }
     }
 
+    foreach ($captureResult in @(Get-AiStackCaptureDoctorResults)) {
+        [void]$results.Add($captureResult)
+    }
+
     $results | Format-Table -AutoSize | Out-Host
     return @($results)
 }
@@ -1172,6 +1176,7 @@ function Uninstall-AiStack {
 }
 
 . (Join-Path $PSScriptRoot 'SessionImport.ps1')
+. (Join-Path $PSScriptRoot 'CaptureInstall.ps1')
 
 Export-ModuleMember -Function @(
     'Get-DotEnvValues',
@@ -1187,6 +1192,7 @@ Export-ModuleMember -Function @(
     'Get-AiStackStatus',
     'Show-AiStackLogs',
     'Install-AiStackClients',
+    'Install-AiStackCapture',
     'Import-AiStackSessions',
     'Invoke-AiStackSessionEnrichment',
     'Uninstall-AiStack'

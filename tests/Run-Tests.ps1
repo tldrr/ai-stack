@@ -502,6 +502,164 @@ command = "old"
         Assert-True ($invalidationWrite -ge 0 -and $invalidationWrite -lt $manifestWrite) 'Derived-data invalidation is checkpointed after the import manifest.'
     }
 
+    Invoke-Test 'Continuous-capture generation is safe and idempotent' {
+        $module = Get-Module AiStack
+        $result = & $module {
+            param($Root)
+
+            $piSource = @'
+import path from "node:path";
+import crypto from "node:crypto";
+
+type TextBlock = { type?: string; text?: string };
+'@
+            $piFirst = Add-AiStackPiEnvironmentBootstrap -Content $piSource
+            $piSecond = Add-AiStackPiEnvironmentBootstrap -Content $piFirst
+            $copilotHooks = '{"hooks":{"sessionStart":[{"type":"command","command":"node ${COPILOT_PLUGIN_ROOT}/scripts/session-start.mjs"}]}}'
+            $copilotRunnerPath = 'C:\capture\ai-stack-runner.mjs'
+            $copilotFirst = Add-AiStackCopilotEnvironmentRunner `
+                -Content $copilotHooks `
+                -RunnerPath $copilotRunnerPath
+            $copilotSecond = Add-AiStackCopilotEnvironmentRunner `
+                -Content $copilotFirst `
+                -RunnerPath $copilotRunnerPath
+            $copilotRunner = Get-AiStackCopilotEnvironmentRunner
+
+            $hermesSource = @"
+model:
+  default: test
+memory:
+  provider:
+  session_store: true
+unrelated:
+  keep: value
+"@
+            $hermesFirst = Merge-AiStackHermesMemoryProvider -Content $hermesSource
+            $hermesSecond = Merge-AiStackHermesMemoryProvider -Content $hermesFirst
+            $nestedHermes = Merge-AiStackHermesMemoryProvider -Content @"
+memory:
+  nested:
+    provider: keep
+  provider: previous
+"@
+            $commentedHermes = Merge-AiStackHermesMemoryProvider -Content @"
+memory:
+    # A deeply-indented comment must not determine mapping indentation.
+  provider: previous
+  keep: true
+"@
+            $spacedHermes = Merge-AiStackHermesMemoryProvider -Content @"
+memory:
+  session_store: true
+
+  provider: previous
+"@
+            $headerCommentHermes = Merge-AiStackHermesMemoryProvider -Content @"
+memory: # keep this comment
+  provider: previous
+"@
+            $flowHermesRejected = $false
+            try {
+                [void](Merge-AiStackHermesMemoryProvider -Content 'memory: { provider: previous, keep: true }')
+            }
+            catch {
+                $flowHermesRejected = $true
+            }
+            $blockHermesRejected = $false
+            try {
+                [void](Merge-AiStackHermesMemoryProvider -Content @"
+memory:
+  provider: >-
+    previous
+"@)
+            }
+            catch {
+                $blockHermesRejected = $true
+            }
+            $previousHermesHome = $env:HERMES_HOME
+            try {
+                $env:HERMES_HOME = Join-Path $Root 'custom-hermes'
+                $customHermesHome = Get-AiStackHermesHome
+            }
+            finally {
+                if ($null -eq $previousHermesHome) {
+                    Remove-Item Env:\HERMES_HOME -ErrorAction SilentlyContinue
+                }
+                else {
+                    $env:HERMES_HOME = $previousHermesHome
+                }
+            }
+            $hermesPlugin = Add-AiStackHermesWindowsHome -Content 'candidates: list[Path] = []'
+            $hermesPluginAgain = Add-AiStackHermesWindowsHome -Content $hermesPlugin
+
+            $managedPath = Join-Path $Root 'capture\managed.txt'
+            $firstWrite = Set-AiStackManagedFile -Path $managedPath -Content 'first'
+            $secondWrite = Set-AiStackManagedFile -Path $managedPath -Content 'first'
+            $thirdWrite = Set-AiStackManagedFile -Path $managedPath -Content 'second'
+            [pscustomobject]@{
+                PiFirst = $piFirst
+                PiSecond = $piSecond
+                CopilotFirst = $copilotFirst
+                CopilotSecond = $copilotSecond
+                CopilotRunner = $copilotRunner
+                HermesFirst = $hermesFirst
+                HermesSecond = $hermesSecond
+                NestedHermes = $nestedHermes
+                CommentedHermes = $commentedHermes
+                SpacedHermes = $spacedHermes
+                HeaderCommentHermes = $headerCommentHermes
+                NestedProvider = Get-AiStackHermesMemoryProvider -Content $nestedHermes
+                FlowHermesRejected = $flowHermesRejected
+                BlockHermesRejected = $blockHermesRejected
+                CustomHermesHome = $customHermesHome
+                HermesPlugin = $hermesPlugin
+                HermesPluginAgain = $hermesPluginAgain
+                FirstWrite = $firstWrite
+                SecondWrite = $secondWrite
+                ThirdWrite = $thirdWrite
+                ManagedContent = [System.IO.File]::ReadAllText($managedPath)
+                BackupCount = @(Get-ChildItem "$managedPath.ai-stack-backup-*").Count
+                CaptureSource = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\scripts\CaptureInstall.ps1'))
+            }
+        } $tempRoot
+
+        Assert-Equal $result.PiFirst $result.PiSecond 'pi bootstrap was duplicated.'
+        Assert-Equal 1 ([regex]::Matches($result.PiFirst, 'loadAiStackAgentMemoryEnv\(\);').Count) 'pi bootstrap was not generated exactly once.'
+        Assert-True ($result.PiFirst -notmatch 'AGENTMEMORY_SECRET=') 'pi extension embeds an AgentMemory secret.'
+        Assert-Equal $result.CopilotFirst $result.CopilotSecond 'Copilot hook runner was duplicated.'
+        Assert-True ($result.CopilotFirst -match 'C:\\\\capture\\\\ai-stack-runner\.mjs') 'Copilot hook does not use the absolute generated runner path.'
+        Assert-True ($result.CopilotFirst -match 'session-start\.mjs') 'Copilot hook lost its official script target.'
+        Assert-True ($result.CopilotRunner -notmatch 'AGENTMEMORY_SECRET=') 'Copilot hook runner embeds an AgentMemory secret.'
+        Assert-True ($result.CopilotRunner -match '\.agentmemory') 'Copilot hook runner does not load the protected local environment.'
+        Assert-Equal $result.HermesFirst $result.HermesSecond 'Hermes memory-provider merge is not idempotent.'
+        Assert-True ($result.HermesFirst -match '(?m)^  provider: agentmemory$') 'Hermes provider was not selected.'
+        Assert-True ($result.HermesFirst -match '(?m)^unrelated:\r?$') 'Hermes unrelated configuration was removed.'
+        Assert-True ($result.NestedHermes -match '(?m)^    provider: keep\r?$') 'Hermes nested provider setting was overwritten.'
+        Assert-True ($result.NestedHermes -match '(?m)^  provider: agentmemory\r?$') 'Hermes top-level memory provider was not selected.'
+        Assert-True ($result.CommentedHermes -match '(?m)^  provider: agentmemory\r?$') 'Hermes comment indentation corrupted the mapping.'
+        Assert-Equal 1 ([regex]::Matches($result.SpacedHermes, '(?m)^  provider: agentmemory\r?$').Count) 'Hermes provider after a blank line was duplicated.'
+        Assert-True ($result.HeaderCommentHermes -match '(?m)^  provider: agentmemory\r?$') 'Hermes memory header comment prevented the provider merge.'
+        Assert-True ($result.HeaderCommentHermes.Contains('memory: # keep this comment')) 'Hermes memory header comment was removed.'
+        Assert-Equal 'agentmemory' $result.NestedProvider 'Hermes provider validation selected a nested provider.'
+        Assert-True $result.FlowHermesRejected 'Hermes flow-style memory YAML was modified unsafely.'
+        Assert-True $result.BlockHermesRejected 'Hermes block-scalar provider YAML was modified unsafely.'
+        Assert-True ($result.CustomHermesHome -like '*custom-hermes') 'HERMES_HOME override was ignored.'
+        Assert-Equal $result.HermesPlugin $result.HermesPluginAgain 'Hermes Windows home patch is not idempotent.'
+        Assert-True ($result.HermesPlugin -match 'Path\.home\(\)') 'Hermes cannot find the protected environment on native Windows.'
+        Assert-True ($result.FirstWrite -and -not $result.SecondWrite -and $result.ThirdWrite) 'Managed-file writes are not idempotent.'
+        Assert-Equal 'second' $result.ManagedContent 'Managed file did not receive the new content.'
+        Assert-Equal 1 $result.BackupCount 'Managed-file replacement did not create exactly one backup.'
+        Assert-True ($result.CaptureSource -match 'd60652a7058773fa9428fa720eda38942f12f014') 'Capture integrations are not pinned to the reviewed upstream commit.'
+        Assert-Equal 20 ([regex]::Matches($result.CaptureSource, "[a-f0-9]{64}'").Count) 'Capture integration hashes are incomplete.'
+        Assert-True ($result.CaptureSource -match 'chmod 600') 'WSL secret permissions are not enforced.'
+        Assert-True ($result.CaptureSource -match 'SkipIfUnavailable:\(\$Agent -eq ''All''\)') 'An unavailable Copilot installation blocks other capture agents.'
+        Assert-True ($result.CaptureSource -match 'Get-AiStackCopilotPluginMcpConfig') 'Copilot plugin MCP execution is not routed through the pinned launcher.'
+        Assert-True ($result.CaptureSource -notmatch "args\s*=\s*@\(''-y'',\s*''@agentmemory/mcp''") 'Copilot plugin MCP still uses an unpinned package.'
+        Assert-True ($result.CaptureSource -match '\.env\.ai-stack-backup-\*') 'AgentMemory secret backups are not protected.'
+        Assert-True ($result.CaptureSource -match 'Sync-AiStackPinnedSkills') 'Copilot plugin skills are not pinned.'
+        Assert-True ($result.CaptureSource -match '\$Agent -ne ''All''') 'All-agent installation failures are not isolated.'
+    }
+
     Invoke-Test 'Doctor reports healthy injected probes' {
         $results = Invoke-AiStackDoctor `
             -CommandProbe { param($name) $true } `

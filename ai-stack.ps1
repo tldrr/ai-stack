@@ -1,11 +1,14 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('help', 'setup', 'configure', 'configure-tunnel', 'start', 'stop', 'restart', 'status', 'doctor', 'logs', 'install-clients', 'import-sessions', 'enrich-sessions', 'uninstall')]
+    [ValidateSet('help', 'setup', 'configure', 'configure-tunnel', 'start', 'stop', 'restart', 'status', 'doctor', 'logs', 'install-clients', 'install-capture', 'import-sessions', 'enrich-sessions', 'uninstall')]
     [string]$Command = 'help',
 
     [ValidateSet('All', 'Copilot', 'Codex')]
     [string]$Client = 'All',
+
+    [ValidateSet('All', 'Copilot', 'Pi', 'Hermes')]
+    [string]$Agent = 'All',
 
     [ValidateSet('litellm', 'agentmemory', 'cloudflared')]
     [string]$Service,
@@ -38,6 +41,7 @@ ai-stack management
   .\ai-stack.ps1 doctor
   .\ai-stack.ps1 logs [-Service litellm|agentmemory|cloudflared]
   .\ai-stack.ps1 install-clients [-Client All|Copilot|Codex]
+  .\ai-stack.ps1 install-capture [-Agent All|Copilot|Pi|Hermes]
   .\ai-stack.ps1 import-sessions [-Source All|Hermes|Pi|Copilot|VSCode] [-DryRun] [-Force]
   .\ai-stack.ps1 enrich-sessions [-Source All|Hermes|Pi|Copilot|VSCode] [-DryRun] [-Force]
   .\ai-stack.ps1 uninstall [-DeleteData] [-Force]
@@ -79,6 +83,9 @@ ai-stack management
     }
     'install-clients' {
         Install-AiStackClients -Client $Client
+    }
+    'install-capture' {
+        Install-AiStackCapture -Agent $Agent
     }
     'import-sessions' {
         Import-AiStackSessions -Source $Source -DryRun:$DryRun -Force:$Force
