@@ -1,0 +1,190 @@
+name: ${COMPOSE_PROJECT_NAME:-ai-stack}
+
+services:
+  litellm:
+    image: ${LITELLM_IMAGE:-ghcr.io/berriai/litellm:v1.95.0}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${LITELLM_PORT:-4000}:4000"
+    environment:
+      GITHUB_COPILOT_TOKEN_DIR: /var/lib/litellm/github-copilot
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?Run .\ai-stack.ps1 setup first}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    volumes:
+      - ./config/litellm.yaml:/app/config.yaml:ro
+      - type: bind
+        source: ${AI_STACK_HOME:?Run .\ai-stack.ps1 setup first}/data/github-copilot
+        target: /var/lib/litellm/github-copilot
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      start_period: 5m
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    networks:
+      - ai-stack
+
+  agentmemory:
+    build:
+      context: ./docker/agentmemory
+      args:
+        AGENTMEMORY_VERSION: "0.9.28"
+        III_VERSION: "0.11.2"
+        III_SDK_VERSION: "0.11.2"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    ports:
+      - "127.0.0.1:${AGENTMEMORY_REST_PORT:-3111}:3111"
+      - "127.0.0.1:${AGENTMEMORY_VIEWER_PORT:-3113}:3113"
+    environment:
+      OPENAI_API_KEY: ${LITELLM_MASTER_KEY:?Run .\ai-stack.ps1 setup first}
+      OPENAI_BASE_URL: http://litellm:4000/v1
+      OPENAI_MODEL: ${AGENTMEMORY_LLM_MODEL:-gpt-5.6-sol}
+      EMBEDDING_PROVIDER: ${AGENTMEMORY_EMBEDDING_PROVIDER:-local}
+      OPENAI_EMBEDDING_MODEL: text-embedding-3-small
+      AGENTMEMORY_INJECT_CONTEXT: ${AGENTMEMORY_INJECT_CONTEXT:-true}
+      AGENTMEMORY_AUTO_COMPRESS: ${AGENTMEMORY_AUTO_COMPRESS:-false}
+      AGENTMEMORY_SLOTS: ${AGENTMEMORY_SLOTS:-true}
+      GRAPH_EXTRACTION_ENABLED: ${GRAPH_EXTRACTION_ENABLED:-true}
+      CONSOLIDATION_ENABLED: ${CONSOLIDATION_ENABLED:-true}
+      AGENTMEMORY_VIEWER_HOST: 0.0.0.0
+      VIEWER_ALLOWED_HOSTS: localhost:${AGENTMEMORY_VIEWER_PORT:-3113},127.0.0.1:${AGENTMEMORY_VIEWER_PORT:-3113},${CLOUDFLARE_VIEWER_HOSTNAME:-memory.example.com}
+      VIEWER_ALLOWED_ORIGINS: http://localhost:${AGENTMEMORY_VIEWER_PORT:-3113},http://127.0.0.1:${AGENTMEMORY_VIEWER_PORT:-3113},https://${CLOUDFLARE_VIEWER_HOSTNAME:-memory.example.com}
+    secrets:
+      - agentmemory-secret
+    volumes:
+      - type: bind
+        source: ${AI_STACK_HOME:?Run .\ai-stack.ps1 setup first}/data/agentmemory
+        target: /data
+    depends_on:
+      litellm:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:3111/agentmemory/livez || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    networks:
+      - ai-stack
+
+  iii-console:
+    build:
+      context: ./docker/iii-console
+      args:
+        III_CONSOLE_VERSION: 0.22.1
+        III_CONSOLE_SHA256: b6c7f2ff6739d1142a156ff3cf6e7fb81593b96ccd7b4fa7671600962038cede
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${AGENTMEMORY_CONSOLE_PORT:-3114}:3114"
+    command:
+      - --port
+      - "3114"
+      - --host
+      - 0.0.0.0
+      - --engine-host
+      - agentmemory
+      - --engine-port
+      - "3111"
+      - --ws-port
+      - "3112"
+      - --bridge-port
+      - "49134"
+      - --no-otel
+    depends_on:
+      agentmemory:
+        condition: service_healthy
+    networks:
+      - ai-stack
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3114/api/engine/_console/health | grep -q '\"status\":\"healthy\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  iii-console-auth:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - export CONSOLE_ORIGIN_SECRET="$$(cat /run/secrets/console-origin-secret)"; exec caddy run --config /etc/caddy/Caddyfile
+    secrets:
+      - console-origin-secret
+    volumes:
+      - ./cloudflare/Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      iii-console:
+        condition: service_healthy
+    networks:
+      - ai-stack
+    read_only: true
+    tmpfs:
+      - /config
+      - /data
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --header=\"X-Ai-Stack-Origin: $$(cat /run/secrets/console-origin-secret)\" http://127.0.0.1:3115/_console/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  cloudflared:
+    image: cloudflare/cloudflared:2026.7.3
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    command:
+      - tunnel
+      - --config
+      - /etc/cloudflared/config.yml
+      - --no-autoupdate
+      - run
+    volumes:
+      - type: bind
+        source: ${AI_STACK_HOME:?Run .\ai-stack.ps1 setup first}/cloudflared
+        target: /etc/cloudflared
+        read_only: true
+    depends_on:
+      agentmemory:
+        condition: service_healthy
+    networks:
+      - ai-stack
+
+secrets:
+  agentmemory-secret:
+    file: "${AI_STACK_HOME:?Run .\\ai-stack.ps1 setup first}/agentmemory-secret"
+  console-origin-secret:
+    file: "${AI_STACK_HOME:?Run .\\ai-stack.ps1 setup first}/console-origin-secret"
+
+networks:
+  ai-stack:
+    driver: bridge

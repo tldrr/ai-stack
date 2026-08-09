@@ -1,0 +1,91 @@
+model_list:
+  # Responses-only Copilot models. LiteLLM bridges Chat Completions callers.
+  - model_name: gpt-5.3-codex
+    model_info:
+      mode: responses
+    litellm_params:
+      model: github_copilot/gpt-5.3-codex
+  - model_name: gpt-5.4-mini
+    model_info:
+      mode: responses
+    litellm_params:
+      model: github_copilot/gpt-5.4-mini
+  - model_name: gpt-5.5
+    model_info:
+      mode: responses
+    litellm_params:
+      model: github_copilot/gpt-5.5
+  - model_name: gpt-5.6-luna
+    model_info:
+      mode: responses
+    litellm_params:
+      model: github_copilot/gpt-5.6-luna
+  - model_name: gpt-5.6-sol
+    model_info:
+      mode: responses
+    litellm_params:
+      model: github_copilot/gpt-5.6-sol
+  - model_name: gpt-5.6-terra
+    model_info:
+      mode: responses
+    litellm_params:
+      model: github_copilot/gpt-5.6-terra
+  - model_name: grok-4.5
+    model_info:
+      mode: responses
+    litellm_params:
+      model: github_copilot/grok-4.5
+  - model_name: mai-code-1-flash-picker
+    model_info:
+      mode: responses
+    litellm_params:
+      model: github_copilot/mai-code-1-flash-picker
+
+  # Copilot models with native Chat Completions support.
+  - model_name: gpt-5.4
+    litellm_params:
+      model: github_copilot/gpt-5.4
+  - model_name: gpt-5-mini
+    litellm_params:
+      model: github_copilot/gpt-5-mini
+  - model_name: claude-opus-4.6
+    litellm_params:
+      model: github_copilot/claude-opus-4.6
+  - model_name: claude-opus-4.7
+    litellm_params:
+      model: github_copilot/claude-opus-4.7
+  - model_name: claude-opus-4.8
+    litellm_params:
+      model: github_copilot/claude-opus-4.8
+  - model_name: claude-opus-5
+    litellm_params:
+      model: github_copilot/claude-opus-5
+  - model_name: claude-sonnet-4.6
+    litellm_params:
+      model: github_copilot/claude-sonnet-4.6
+  - model_name: claude-sonnet-5
+    litellm_params:
+      model: github_copilot/claude-sonnet-5
+  - model_name: claude-haiku-4.5
+    litellm_params:
+      model: github_copilot/claude-haiku-4.5
+  - model_name: gemini-3.1-pro-preview
+    litellm_params:
+      model: github_copilot/gemini-3.1-pro-preview
+  - model_name: gemini-3.5-flash
+    litellm_params:
+      model: github_copilot/gemini-3.5-flash
+  - model_name: gemini-3.6-flash
+    litellm_params:
+      model: github_copilot/gemini-3.6-flash
+
+  # Optional. This route is usable only when OPENAI_API_KEY is set locally.
+  - model_name: text-embedding-3-small
+    model_info:
+      mode: embedding
+    litellm_params:
+      model: openai/text-embedding-3-small
+      api_key: os.environ/OPENAI_API_KEY
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY

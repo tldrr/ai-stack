@@ -1,0 +1,7 @@
+:3115 {
+	@authorized header X-Ai-Stack-Origin {$CONSOLE_ORIGIN_SECRET}
+	handle @authorized {
+		reverse_proxy iii-console:3114
+	}
+	respond "Unauthorized" 401
+}

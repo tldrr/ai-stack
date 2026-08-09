@@ -1,0 +1,7 @@
+.ai-stack/
+.wrangler/
+.env
+.state/
+backups/
+*.log
+docker-compose.override.yml

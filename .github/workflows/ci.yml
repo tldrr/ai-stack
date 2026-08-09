@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  powershell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Run unit and static tests
+        shell: powershell
+        run: .\tests\Run-Tests.ps1
+
+  compose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4.2.2
+      - name: Generate safe test configuration
+        shell: pwsh
+        run: ./ai-stack.ps1 setup
+      - name: Render Docker Compose
+        run: docker compose --env-file "$HOME/.ai-stack/.env" -f compose.yaml config --quiet
+      - name: Build patched AgentMemory image
+        run: docker build --file docker/agentmemory/Dockerfile docker/agentmemory
