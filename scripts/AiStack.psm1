@@ -19,6 +19,7 @@ $script:ComposePath = Join-Path $script:Root 'compose.yaml'
 $script:StatePath = $script:DataPath
 $script:McpLauncherPath = Join-Path $script:StatePath 'agentmemory-mcp.ps1'
 $script:AgentMemorySecretPath = Join-Path $script:StatePath 'agentmemory-secret'
+$script:ConsoleOriginSecretPath = Join-Path $script:StatePath 'console-origin-secret'
 $script:CloudflareStatePath = Join-Path $script:StatePath 'cloudflared'
 $script:CloudflareConfigPath = Join-Path $script:CloudflareStatePath 'config.yml'
 $script:CloudflareCredentialsPath = Join-Path $script:CloudflareStatePath 'credentials.json'
@@ -431,6 +432,10 @@ function Initialize-AiStackConfiguration {
         }
         Write-Utf8NoBom -Path $script:AgentMemorySecretPath -Content (New-AiStackSecret -Prefix 'am_')
     }
+    if (-not (Test-Path -LiteralPath $script:ConsoleOriginSecretPath) -or
+        [string]::IsNullOrWhiteSpace([System.IO.File]::ReadAllText($script:ConsoleOriginSecretPath))) {
+        Write-Utf8NoBom -Path $script:ConsoleOriginSecretPath -Content (New-AiStackSecret -Prefix 'origin_')
+    }
     New-McpLauncher
     Update-MigratedClientLaunchers
     Protect-AiStackData
@@ -530,7 +535,7 @@ function New-CloudflareTunnelConfig {
     if (-not [string]::IsNullOrWhiteSpace($ConsoleHostname)) {
         $ingress += @(
             "  - hostname: $ConsoleHostname"
-            '    service: http://iii-console:3114'
+            '    service: http://iii-console-auth:3115'
         )
     }
     $ingress += '  - service: http_status:404'
@@ -727,7 +732,6 @@ function Initialize-CloudflareTunnel {
         throw 'ConsoleHostname and DisableConsole cannot be used together.'
     }
     $environment = [System.IO.File]::ReadAllText($script:EnvPath)
-    $originalEnvironment = $environment
     $environmentChanged = $false
     foreach ($requestedHostname in @(
         @{ Parameter = 'RestHostname'; Environment = 'CLOUDFLARE_REST_HOSTNAME'; Value = $RestHostname }
@@ -826,19 +830,11 @@ function Initialize-CloudflareTunnel {
 
     $runningServices = @(Get-AiStackRunningServices)
     $connectorWasRunning = $runningServices -contains 'cloudflared'
-    $existingConfig = if (Test-Path -LiteralPath $script:CloudflareConfigPath) {
-        [System.IO.File]::ReadAllText($script:CloudflareConfigPath)
-    }
-    else {
-        ''
-    }
-    $hadConsoleIngress = $consoleHostnameValue -and
-        $existingConfig -match "(?im)^\s*-\s*hostname:\s*$([regex]::Escape($consoleHostnameValue))\s*$"
-
-    $baseConfigChanged = New-CloudflareTunnelConfig `
+    $configChanged = New-CloudflareTunnelConfig `
         -TunnelId $tunnelId `
         -RestHostname $values['CLOUDFLARE_REST_HOSTNAME'] `
-        -ViewerHostname $values['CLOUDFLARE_VIEWER_HOSTNAME']
+        -ViewerHostname $values['CLOUDFLARE_VIEWER_HOSTNAME'] `
+        -ConsoleHostname $consoleHostnameValue
 
     [void](Invoke-CloudflaredCommand -Command $cloudflared -Arguments @(
         'tunnel', '--config', $script:CloudflareConfigPath, 'ingress', 'validate'
@@ -854,41 +850,7 @@ function Initialize-CloudflareTunnel {
         ))
     }
 
-    if ($consoleHostnameValue) {
-        if (-not (Test-CloudflareAccessProtection -Hostname $consoleHostnameValue)) {
-            Write-Utf8NoBom -Path $script:EnvPath -Content $originalEnvironment
-            if ([string]::IsNullOrEmpty($existingConfig)) {
-                Remove-Item -LiteralPath $script:CloudflareConfigPath -Force -ErrorAction SilentlyContinue
-            }
-            else {
-                Write-Utf8NoBom -Path $script:CloudflareConfigPath -Content $existingConfig
-            }
-            if ($hadConsoleIngress -and $connectorWasRunning) {
-                try {
-                    Invoke-DockerCompose -Arguments @('--profile', 'tunnel', 'stop', 'cloudflared')
-                }
-                catch {
-                    Write-Warning "Could not stop the existing Cloudflare connector: $($_.Exception.Message)"
-                }
-            }
-            throw "Cloudflare Access is not protecting https://$consoleHostnameValue. Ensure Cloudflare has issued a valid edge certificate (nested hostnames can require Total TLS or Advanced Certificate Manager), then create a Self-hosted Access application for the entire hostname with an identity allow policy and rerun configure-tunnel. The console origin route was not published."
-        }
-
-        [void](New-CloudflareTunnelConfig `
-            -TunnelId $tunnelId `
-            -RestHostname $values['CLOUDFLARE_REST_HOSTNAME'] `
-            -ViewerHostname $values['CLOUDFLARE_VIEWER_HOSTNAME'] `
-            -ConsoleHostname $consoleHostnameValue)
-        [void](Invoke-CloudflaredCommand -Command $cloudflared -Arguments @(
-            'tunnel', '--config', $script:CloudflareConfigPath, 'ingress', 'validate'
-        ))
-        if ($connectorWasRunning) {
-            Invoke-DockerCompose -Arguments @(
-                '--profile', 'tunnel', 'up', '-d', '--no-deps', '--force-recreate', 'cloudflared'
-            )
-        }
-    }
-    elseif ($baseConfigChanged -and $connectorWasRunning) {
+    if ($configChanged -and $connectorWasRunning) {
         Invoke-DockerCompose -Arguments @(
             '--profile', 'tunnel', 'up', '-d', '--no-deps', '--force-recreate', 'cloudflared'
         )
@@ -896,9 +858,94 @@ function Initialize-CloudflareTunnel {
 
     Write-Host "Cloudflare tunnel '$tunnelName' is configured from $script:CloudflareConfigPath."
     if ($consoleHostnameValue) {
-        Write-Host "Authenticated iii Console: https://$consoleHostnameValue"
+        Write-Host "Secret-protected iii Console origin: https://$consoleHostnameValue"
     }
     Write-Host 'Run .\ai-stack.ps1 start -Tunnel to launch its Docker-managed connector.'
+}
+
+function Invoke-WranglerCommand {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+
+    $npx = Get-Command npx.cmd -ErrorAction SilentlyContinue
+    if (-not $npx) { $npx = Get-Command npx -CommandType Application -ErrorAction Stop }
+    & $npx.Source '-y' 'wrangler@4.120.0' @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Wrangler failed while running '$($Arguments -join ' ')'."
+    }
+}
+
+function Initialize-CloudflareEdge {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$RestHostname,
+        [Parameter(Mandatory = $true)][string]$ViewerHostname,
+        [Parameter(Mandatory = $true)][string]$ConsoleHostname,
+        [Parameter(Mandatory = $true)][string]$ConsoleOriginHostname
+    )
+
+    foreach ($entry in @(
+        @{ Name = 'RestHostname'; Value = $RestHostname }
+        @{ Name = 'ViewerHostname'; Value = $ViewerHostname }
+        @{ Name = 'ConsoleHostname'; Value = $ConsoleHostname }
+        @{ Name = 'ConsoleOriginHostname'; Value = $ConsoleOriginHostname }
+    )) {
+        Assert-CloudflareHostname -Name $entry.Name -Hostname $entry.Value
+    }
+    Initialize-AiStackConfiguration
+    Invoke-DockerCompose -Arguments @('up', '-d', '--build', 'iii-console-auth')
+    Initialize-CloudflareTunnel -ConsoleHostname $ConsoleOriginHostname
+
+    $values = Get-DotEnvValues -Path $script:EnvPath
+    $deployArguments = @(
+        'deploy', (Join-Path $script:Root 'cloudflare\edge-worker.js'),
+        '--name', 'ai-stack-edge',
+        '--compatibility-date', '2026-08-09',
+        '--domain', $RestHostname,
+        '--domain', $ViewerHostname,
+        '--domain', $ConsoleHostname,
+        '--var', "REST_HOSTNAME:$RestHostname",
+        '--var', "VIEWER_HOSTNAME:$ViewerHostname",
+        '--var', "CONSOLE_HOSTNAME:$ConsoleHostname",
+        '--var', "REST_ORIGIN:https://$($values['CLOUDFLARE_REST_HOSTNAME'])",
+        '--var', "VIEWER_ORIGIN:https://$($values['CLOUDFLARE_VIEWER_HOSTNAME'])",
+        '--var', "CONSOLE_ORIGIN:https://$ConsoleOriginHostname"
+    )
+    Invoke-WranglerCommand -Arguments @($deployArguments + @(
+        '--var', 'CONSOLE_ENABLED:false',
+        '--keep-vars'
+    ))
+    $originSecret = [System.IO.File]::ReadAllText($script:ConsoleOriginSecretPath).Trim()
+    $npx = Get-Command npx.cmd -ErrorAction SilentlyContinue
+    if (-not $npx) { $npx = Get-Command npx -CommandType Application -ErrorAction Stop }
+    $originSecret | & $npx.Source '-y' 'wrangler@4.120.0' `
+        'secret' 'put' 'CONSOLE_ORIGIN_SECRET' '--name' 'ai-stack-edge'
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Could not store the console origin secret in the edge Worker.'
+    }
+
+    $ready = $false
+    for ($attempt = 0; $attempt -lt 24; $attempt++) {
+        if (Test-CloudflareAccessProtection -Hostname $ConsoleHostname) {
+            $ready = $true
+            break
+        }
+        Start-Sleep -Seconds 5
+    }
+    if (-not $ready) {
+        throw "Cloudflare Access is not protecting https://$ConsoleHostname. The console route remains disabled. Create a self-hosted Access application for that hostname, add a restrictive Allow policy, then rerun configure-edge."
+    }
+    Invoke-WranglerCommand -Arguments @($deployArguments + @(
+        '--var', 'CONSOLE_ENABLED:true',
+        '--keep-vars'
+    ))
+    if (-not (Test-CloudflareAccessProtection -Hostname $ConsoleHostname)) {
+        throw "Cloudflare Access stopped protecting https://$ConsoleHostname after the edge deployment."
+    }
+    Write-Host "Cloudflare edge endpoints configured:"
+    Write-Host "  REST: https://$RestHostname"
+    Write-Host "  Viewer: https://$ViewerHostname"
+    Write-Host "  iii Console: https://$ConsoleHostname"
+    Write-Host 'iii Console authentication is enforced by Cloudflare Access.'
 }
 
 function Assert-TunnelConfigured {
@@ -1415,6 +1462,7 @@ Export-ModuleMember -Function @(
     'Initialize-AiStackConfiguration',
     'New-CloudflareTunnelConfig',
     'Initialize-CloudflareTunnel',
+    'Initialize-CloudflareEdge',
     'Merge-CopilotMcpConfig',
     'Merge-CodexMcpConfig',
     'Invoke-AiStackDoctor',

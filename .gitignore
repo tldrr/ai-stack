@@ -1,4 +1,5 @@
 .ai-stack/
+.wrangler/
 .env
 .state/
 backups/

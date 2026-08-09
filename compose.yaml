@@ -124,6 +124,39 @@ services:
       retries: 12
       start_period: 15s
 
+  iii-console-auth:
+    image: caddy:2.10.2-alpine
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - export CONSOLE_ORIGIN_SECRET="$$(cat /run/secrets/console-origin-secret)"; exec caddy run --config /etc/caddy/Caddyfile
+    secrets:
+      - console-origin-secret
+    volumes:
+      - ./cloudflare/Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      iii-console:
+        condition: service_healthy
+    networks:
+      - ai-stack
+    read_only: true
+    tmpfs:
+      - /config
+      - /data
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --header=\"X-Ai-Stack-Origin: $$(cat /run/secrets/console-origin-secret)\" http://127.0.0.1:3115/_console/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
   cloudflared:
     image: cloudflare/cloudflared:2026.7.3
     profiles: ["tunnel"]
@@ -148,6 +181,8 @@ services:
 secrets:
   agentmemory-secret:
     file: "${AI_STACK_HOME:?Run .\\ai-stack.ps1 setup first}/agentmemory-secret"
+  console-origin-secret:
+    file: "${AI_STACK_HOME:?Run .\\ai-stack.ps1 setup first}/console-origin-secret"
 
 networks:
   ai-stack:

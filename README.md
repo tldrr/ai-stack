@@ -303,40 +303,33 @@ AgentMemory data directory.
 
 ## Optional Cloudflare Tunnel
 
-This stack uses a **locally managed** named tunnel. The route definition is a
-generated config file, not dashboard state:
+This stack uses a **locally managed** named tunnel for stable first-level
+origins and an optional Cloudflare Worker for nested public aliases:
 
 | `~\.ai-stack\.env` hostname | Config-file service |
 | --- | --- |
 | `CLOUDFLARE_REST_HOSTNAME` | `http://agentmemory:3111` |
 | `CLOUDFLARE_VIEWER_HOSTNAME` | `http://agentmemory:3113` |
-| `CLOUDFLARE_CONSOLE_HOSTNAME` | `http://iii-console:3114` after Access verification |
+| `CLOUDFLARE_CONSOLE_HOSTNAME` | `http://iii-console-auth:3115` |
 
-Install `cloudflared`, open the generated configuration, set
-`CLOUDFLARE_TUNNEL_NAME`, REST, and viewer hostnames. Before enabling the
-console route, create a Cloudflare Zero Trust **Access > Applications >
-Self-hosted** application for the complete console hostname. Add an identity
-allow policy restricted to your account or organization and require MFA. Do not
-use a Bypass policy.
-
-Cloudflare Universal SSL normally covers the zone apex and one subdomain level.
-Names such as `api.mem.example.com` and `iii.mem.example.com` may therefore
-require **SSL/TLS > Edge Certificates > Total TLS** or an Advanced Certificate
-covering `*.mem.example.com` before Access can serve them. `configure-tunnel`
-fails closed while DNS, edge TLS, or the Access challenge is unavailable.
-Failed preflight also restores the previous local environment and tunnel
-configuration, so an existing deployment remains active. Use
-`configure-tunnel -DisableConsole` to remove a previously configured console
-origin route and recreate a running connector without it.
+The Console origin is never routed directly to iii Console. A Caddy sidecar
+requires a generated `X-Ai-Stack-Origin` secret before proxying WebSocket or HTTP
+traffic. The edge Worker holds that secret, while Cloudflare Access authenticates
+users before requests reach the Worker. The generated origin value lives in
+ACL-restricted `~\.ai-stack`, not Compose metadata or checked-in configuration.
 
 ```powershell
 winget install --id Cloudflare.cloudflared --exact
 .\ai-stack.ps1 configure
 .\ai-stack.ps1 configure-tunnel `
+  -RestHostname memory-api.example.com `
+  -ViewerHostname memory.example.com
+.\ai-stack.ps1 start -Tunnel
+.\ai-stack.ps1 configure-edge `
   -RestHostname api.mem.example.com `
   -ViewerHostname mem.example.com `
-  -ConsoleHostname iii.mem.example.com
-.\ai-stack.ps1 start -Tunnel
+  -ConsoleHostname iii.mem.example.com `
+  -ConsoleOriginHostname iii-origin.example.com
 ```
 
 On the first run, `cloudflared` opens one browser authorization. It uses that
@@ -345,22 +338,28 @@ create the DNS records; there is no API-token creation or secret copy/paste.
 Later runs reuse the local authorization and tunnel credentials. The command
 writes
 `~\.ai-stack\cloudflared\config.yml`, validates its ingress rules, and idempotently
-creates the DNS routes. For iii Console, it first creates DNS while the tunnel
-still returns its catch-all `404`, then verifies that an unauthenticated request
-is redirected to Cloudflare Access. Only that verified challenge enables
-`http://iii-console:3114`; otherwise configuration fails closed and leaves the
-console origin unpublished. A running connector is recreated after a successful
-change. Tunnel credentials remain in the git-ignored
+creates the DNS routes. Tunnel credentials remain in the git-ignored
 `~\.ai-stack\cloudflared\credentials.json`. Docker mounts this directory
 read-only, and `restart: unless-stopped` provides autostart with Docker Desktop.
 
-The profile is opt-in and does not publish LiteLLM. Apply Cloudflare Access to
-the viewer hostname so the HTML surface is identity-gated. Access policies are
-Cloudflare account control-plane resources and are not part of the
-`cloudflared` ingress file; manage them separately with Cloudflare Access or
-Terraform. AgentMemory also requires its bearer secret for viewer API calls.
-Keep AgentMemory bearer authentication on the REST hostname; if Cloudflare
-Access is added there, non-browser clients also need an Access service token.
+`configure-edge` pins Wrangler 4.120.0 and creates Worker Custom Domains, which
+issue certificates for nested names such as `iii.mem.example.com` without Total
+TLS. Console proxying is fail-closed during deployment. On its first run, the
+command leaves the Console route disabled and asks for a self-hosted Cloudflare
+Access application when one is not already present:
+
+1. In Cloudflare Zero Trust, create a self-hosted application for
+   `iii.mem.example.com`.
+2. Add a restrictive `Allow` policy for the intended email address or identity
+   group. Cloudflare One-time PIN is sufficient for a single-user deployment.
+3. Rerun `configure-edge`. It verifies the Cloudflare Access redirect before
+   enabling Console proxying.
+
+Access application creation is the one manual Cloudflare step because Wrangler
+OAuth does not include Access application write permission. All Tunnel, DNS,
+Worker, custom-domain, and Worker-secret operations use the CLI. The tunnel
+profile remains opt-in and never publishes LiteLLM. AgentMemory bearer
+authentication still protects REST and viewer API calls.
 
 No extra MCP or streaming route is required. The official MCP shim is a local
 stdio process that calls the exposed AgentMemory REST API. Port `3112` is iii's
@@ -372,14 +371,12 @@ Do not also run a token-installed Windows `Cloudflared` service for this stack.
 After the Docker-managed connector is healthy, remove the old service from an
 elevated terminal with `cloudflared service uninstall`.
 
-The tunnel can expose AgentMemory REST, viewer, and the Access-gated iii
-Console. The Console route is never generated without a verified Access login
-challenge because it has no application authentication and can invoke functions
-or mutate raw state. Cloudflare Access protects the SPA, same-origin
-`/api/engine/*` requests, and WebSocket connection with its authenticated
-session cookie. This does not make
-AgentMemory compatible with ChatGPT remote MCP and must not be configured as a
-ChatGPT connector.
+The tunnel and edge Worker can expose AgentMemory REST, viewer, and the
+Access-authenticated iii Console. Access protects the SPA, same-origin
+`/api/engine/*` requests, and WebSocket connection; the independent origin secret
+prevents bypassing it through the tunnel hostname. This does not make AgentMemory
+compatible with ChatGPT remote MCP and must not be configured as a ChatGPT
+connector.
 
 ## Security boundaries
 
@@ -396,10 +393,11 @@ ChatGPT connector.
 - Historical import hashes live in `~\.ai-stack\imports`; transcript text is
   written only to AgentMemory's data directory, not the manifest.
 - All host ports use explicit loopback bindings.
-- iii Console is local-only at `http://localhost:3114`; State is
+- iii Console remains loopback-only at `http://localhost:3114`; State is
   `http://localhost:3114/states` and Traces is
-  `http://localhost:3114/traces`. It is an administrative surface with no
-  authentication and must not be published by the tunnel.
+  `http://localhost:3114/traces`. Remote access is allowed only through the
+  Cloudflare Access application, edge Worker, and secret-authenticated origin
+  proxy.
 - The viewer rejects unexpected Host headers and requires bearer auth for API
   calls because it binds to the private container network for tunnel support.
 - Anyone with local filesystem or Docker daemon access can read secrets and memory

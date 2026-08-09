@@ -188,6 +188,7 @@ try {
         Assert-Equal $secretBefore $secretAfter 'Setup rotated the AgentMemory secret.'
         Assert-True ($envBefore -notmatch 'change-me-generated-by-setup') 'LiteLLM placeholder was not replaced.'
         Assert-True ($secretBefore -match '^am_[0-9a-f]{64}$') 'AgentMemory secret has the wrong format.'
+        Assert-True ([System.IO.File]::ReadAllText((Join-Path $testDataPath 'console-origin-secret')) -match '^origin_[0-9a-f]{64}$') 'Console origin secret has the wrong format.'
         Assert-True (-not (Test-Path (Join-Path $tempRoot '.env'))) 'Legacy .env was not removed.'
         Assert-True (-not (Test-Path (Join-Path $tempRoot '.state'))) 'Legacy .state was not removed.'
         Assert-True (Test-Path (Join-Path $testDataPath 'agentmemory-mcp.ps1')) 'MCP launcher was not consolidated.'
@@ -228,7 +229,7 @@ try {
         Assert-True ($first -match 'credentials-file: /etc/cloudflared/credentials\.json') 'Container credential path is missing.'
         Assert-True ($first -match 'service: http://agentmemory:3111') 'REST ingress is missing.'
         Assert-True ($first -match 'service: http://agentmemory:3113') 'Viewer ingress is missing.'
-        Assert-True ($first -match 'service: http://iii-console:3114') 'Console ingress is missing.'
+        Assert-True ($first -match 'service: http://iii-console-auth:3115') 'Secret-protected console ingress is missing.'
         Assert-True ($first -match '(?m)^  - service: http_status:404\r?$') 'Catch-all ingress is missing.'
         $withoutConsolePath = Join-Path $testDataPath 'cloudflared\without-console.yml'
         [void](New-CloudflareTunnelConfig `
@@ -329,14 +330,22 @@ try {
         $compose = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'compose.yaml'))
         $envExample = [System.IO.File]::ReadAllText((Join-Path $repoRoot '.env.example'))
         $module = [System.IO.File]::ReadAllText($modulePath)
+        $caddy = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'cloudflare\Caddyfile'))
+        $worker = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'cloudflare\edge-worker.js'))
         Assert-True ($compose -match 'source:\s*\$\{AI_STACK_HOME:.*\}/cloudflared') 'Cloudflare home state is not mounted.'
         Assert-True ($compose -match 'read_only:\s*true') 'Cloudflare state is not mounted read-only.'
         Assert-True ($compose -match '/etc/cloudflared/config\.yml') 'Cloudflare config file is not used.'
         Assert-True ($compose -notmatch 'CLOUDFLARE_TUNNEL_TOKEN') 'Compose still depends on a remotely managed tunnel token.'
         Assert-True ($envExample -notmatch 'CLOUDFLARE_TUNNEL_TOKEN') '.env.example still requests a tunnel token.'
         Assert-True ($module -match 'Test-CloudflareAccessProtection') 'Console ingress is not gated by Cloudflare Access.'
-        Assert-True ($module -match 'The console origin route was not published') 'Unsafe console publication does not fail closed.'
-        Assert-True ($module -match 'Write-Utf8NoBom -Path \$script:EnvPath -Content \$originalEnvironment') 'Failed Access preflight does not restore the previous environment.'
+        Assert-True ($compose -match 'console-origin-secret') 'Console origin authentication is not supplied as a Docker secret.'
+        Assert-True ($caddy -match 'X-Ai-Stack-Origin') 'Console origin proxy does not require its secret header.'
+        Assert-True ($worker -match 'CONSOLE_ORIGIN_SECRET') 'Edge Worker does not authenticate to the console origin.'
+        Assert-True ($worker -match 'CONSOLE_ENABLED') 'Edge Worker cannot fail closed before Access is configured.'
+        Assert-True ($worker -notmatch 'Authorization|CONSOLE_ACCESS_PASSWORD') 'Edge Worker still implements user authentication instead of Cloudflare Access.'
+        Assert-True ($module -match "'CONSOLE_ENABLED:false'") 'Edge deployment does not disable console proxying before verifying Access.'
+        Assert-True ($module -match "'CONSOLE_ENABLED:true'") 'Edge deployment does not enable console proxying after verifying Access.'
+        Assert-True ($module -match 'wrangler@4\.120\.0') 'Wrangler deployment tooling is not pinned.'
         Assert-True ($module -match 'DisableConsole') 'A previously published console cannot be disabled explicitly.'
         Assert-True ($module -match "Invoke-DockerCompose -Arguments @\('--profile', 'tunnel', 'down'\)") 'Stop does not include the tunnel profile.'
         Assert-True ($module -match "\$arguments = @\('--profile', 'tunnel', 'down', '--remove-orphans'\)") 'Uninstall does not include the tunnel profile.'

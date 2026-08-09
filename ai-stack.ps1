@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('help', 'setup', 'configure', 'configure-tunnel', 'start', 'stop', 'restart', 'status', 'doctor', 'logs', 'install-clients', 'install-capture', 'import-sessions', 'enrich-sessions', 'uninstall')]
+    [ValidateSet('help', 'setup', 'configure', 'configure-tunnel', 'configure-edge', 'start', 'stop', 'restart', 'status', 'doctor', 'logs', 'install-clients', 'install-capture', 'import-sessions', 'enrich-sessions', 'uninstall')]
     [string]$Command = 'help',
 
     [ValidateSet('All', 'Copilot', 'Codex')]
@@ -19,6 +19,7 @@ param(
     [string]$RestHostname,
     [string]$ViewerHostname,
     [string]$ConsoleHostname,
+    [string]$ConsoleOriginHostname,
 
     [switch]$DisableConsole,
     [switch]$Tunnel,
@@ -39,6 +40,7 @@ ai-stack management
   .\ai-stack.ps1 setup
   .\ai-stack.ps1 configure [-NoOpen]
   .\ai-stack.ps1 configure-tunnel [-RestHostname api.mem.example.com] [-ViewerHostname mem.example.com] [-ConsoleHostname iii.mem.example.com] [-DisableConsole]
+  .\ai-stack.ps1 configure-edge -RestHostname api.mem.example.com -ViewerHostname mem.example.com -ConsoleHostname iii.mem.example.com -ConsoleOriginHostname iii-origin.example.com
   .\ai-stack.ps1 start [-Tunnel]
   .\ai-stack.ps1 stop
   .\ai-stack.ps1 restart
@@ -68,6 +70,13 @@ ai-stack management
             -ViewerHostname $ViewerHostname `
             -ConsoleHostname $ConsoleHostname `
             -DisableConsole:$DisableConsole
+    }
+    'configure-edge' {
+        Initialize-CloudflareEdge `
+            -RestHostname $RestHostname `
+            -ViewerHostname $ViewerHostname `
+            -ConsoleHostname $ConsoleHostname `
+            -ConsoleOriginHostname $ConsoleOriginHostname
     }
     'start' {
         Start-AiStack -Tunnel:$Tunnel
