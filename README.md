@@ -58,6 +58,7 @@ skills; Codex/ChatGPT desktop plugin enablement remains environment-specific.
 flowchart LR
   Clients["Copilot / Codex clients"] -->|"stdio: @agentmemory/mcp"| AM
   AM["AgentMemory 0.9.28<br/>REST :3111 / Viewer :3113"] -->|"OpenAI API<br/>http://litellm:4000/v1"| LL
+  Console["iii Console 0.22.1<br/>:3114"] -->|"internal engine APIs"| AM
   LL["LiteLLM 1.95.0"] --> Copilot["GitHub Copilot"]
   LL -. "optional embedding route" .-> OpenAI["OpenAI"]
   CF["Cloudflare Tunnel<br/>(opt-in)"] -.-> AM
@@ -75,12 +76,20 @@ AgentMemory image build, and an enabled tunnel.
 | LiteLLM | `127.0.0.1:4000` | `litellm:4000` | OpenAI-compatible Copilot proxy |
 | AgentMemory REST | `127.0.0.1:3111` | `agentmemory:3111` | Bearer-authenticated memory API |
 | AgentMemory viewer | `127.0.0.1:3113` | `agentmemory:3113` | Local memory viewer |
+| iii Console | `127.0.0.1:3114` | `iii-console:3114` | Functions, workers, State, and Traces |
 | iii stream | none | `agentmemory:3112` | Internal AgentMemory worker transport |
 
 Host ports are configurable in `~\.ai-stack\.env`; every published port remains
 bound to `127.0.0.1`. LiteLLM is never part of the tunnel profile. All generated
 configuration, credentials, and container data are consolidated under the
 ACL-restricted `%USERPROFILE%\.ai-stack` directory, independent of the clone.
+
+Open the local interfaces at:
+
+- Viewer: `http://localhost:3113`
+- iii Console: `http://localhost:3114`
+- State: `http://localhost:3114/states`
+- Traces: `http://localhost:3114/traces`
 
 ## Management commands
 
@@ -215,6 +224,14 @@ rewritten. The pinned Hermes provider receives a one-line Windows compatibility
 adaptation so its upstream dotenv loader uses Python's resolved home when
 `$HOME` is unset.
 
+`AGENTMEMORY_INJECT_CONTEXT=true` is applied to both the Docker worker and the
+protected native hook environment. Hooks can therefore retrieve relevant prior
+context before a new turn. Rerun `install-capture` after changing this setting.
+`AGENTMEMORY_AUTO_COMPRESS=false` remains explicit: upstream issue
+[#138](https://github.com/rohitg00/agentmemory/issues/138) documents excessive
+LLM usage from per-observation compression. Summarization, consolidation, and
+knowledge-graph extraction remain enabled without that costly feature.
+
 Restart each installed agent after installation. Copilot app can require a
 one-time plugin trust action in its UI. Capture stores source observations
 immediately; AgentMemory's enabled consolidation and graph workflows process
@@ -332,7 +349,9 @@ Do not also run a token-installed Windows `Cloudflared` service for this stack.
 After the Docker-managed connector is healthy, remove the old service from an
 elevated terminal with `cloudflared service uninstall`.
 
-The tunnel only exposes AgentMemory REST and its viewer. It does not make
+The tunnel only exposes AgentMemory REST and its viewer. iii Console is
+intentionally excluded because it has no authentication and can invoke
+functions or mutate raw state. It does not make
 AgentMemory compatible with ChatGPT remote MCP and must not be configured as a
 ChatGPT connector.
 
@@ -351,6 +370,10 @@ ChatGPT connector.
 - Historical import hashes live in `~\.ai-stack\imports`; transcript text is
   written only to AgentMemory's data directory, not the manifest.
 - All host ports use explicit loopback bindings.
+- iii Console is local-only at `http://localhost:3114`; State is
+  `http://localhost:3114/states` and Traces is
+  `http://localhost:3114/traces`. It is an administrative surface with no
+  authentication and must not be published by the tunnel.
 - The viewer rejects unexpected Host headers and requires bearer auth for API
   calls because it binds to the private container network for tunnel support.
 - Anyone with local filesystem or Docker daemon access can read secrets and memory

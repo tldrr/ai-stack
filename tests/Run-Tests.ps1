@@ -136,6 +136,22 @@ try {
         Assert-True ($module -match '\.permissions-v1') 'Windows ACL hardening is repeated against live database files.'
     }
 
+    Invoke-Test 'Local iii Console is pinned and safely exposed' {
+        $compose = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'compose.yaml'))
+        $dockerfile = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'docker\iii-console\Dockerfile'))
+        $entrypoint = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'docker\agentmemory\entrypoint.sh'))
+        Assert-True ($compose -match '127\.0\.0\.1:\$\{AGENTMEMORY_CONSOLE_PORT:-3114\}:3114') 'iii Console is not loopback-only.'
+        Assert-True ($compose -match 'III_CONSOLE_VERSION:\s*0\.22\.1') 'iii Console version is not pinned.'
+        Assert-True ($compose -match 'III_CONSOLE_SHA256:\s*b6c7f2ff6739d1142a156ff3cf6e7fb81593b96ccd7b4fa7671600962038cede') 'iii Console checksum is not pinned.'
+        Assert-True ($dockerfile -match 'sha256sum -c') 'iii Console release checksum is not verified.'
+        Assert-True ($compose -match '(?ms)^\s{2}iii-console:.*?--engine-host\s*\r?\n\s*-\s*agentmemory') 'iii Console does not use internal Docker DNS.'
+        Assert-True ($compose -match '(?ms)^\s{2}iii-console:.*?cap_drop:\s*\r?\n\s*-\s*ALL') 'iii Console retains Linux capabilities.'
+        Assert-True ($compose -match '/api/engine/_console/health') 'iii Console healthcheck does not validate engine connectivity.'
+        Assert-True ($compose -notmatch '(?ms)^\s{2}cloudflared:.*?3114') 'Unauthenticated iii Console is included in the public tunnel.'
+        Assert-True ($entrypoint -match 'sampling_ratio:\s*0\.1') 'Trace sampling is not bounded.'
+        Assert-True ($entrypoint -match 'logs_console_output:\s*false') 'iii console logging can feed back into observability.'
+    }
+
     Invoke-Test 'Docker data persists under the local state directory' {
         $compose = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'compose.yaml'))
         Assert-True ($compose -match 'GITHUB_COPILOT_TOKEN_DIR:\s*/var/lib/litellm/github-copilot') 'LiteLLM does not write Copilot credentials to the mounted directory.'
@@ -146,6 +162,9 @@ try {
 
     Invoke-Test 'Setup is idempotent and generates local secrets' {
         Copy-Item $examplePath (Join-Path $tempRoot '.env')
+        $legacyEnvPath = Join-Path $tempRoot '.env'
+        $legacyEnv = [System.IO.File]::ReadAllText($legacyEnvPath) -replace '(?m)^AGENTMEMORY_(?:CONSOLE_PORT|INJECT_CONTEXT|AUTO_COMPRESS)=.*\r?\n?', ''
+        [System.IO.File]::WriteAllText($legacyEnvPath, $legacyEnv)
         $legacyState = Join-Path $tempRoot '.state'
         New-Item -ItemType Directory -Path $legacyState | Out-Null
         'legacy launcher' | Set-Content -LiteralPath (Join-Path $legacyState 'agentmemory-mcp.ps1')
@@ -175,6 +194,9 @@ try {
         Assert-True (Test-Path (Join-Path $testDataPath 'data\agentmemory')) 'AgentMemory data directory was not created.'
         Assert-True (Test-Path (Join-Path $testDataPath 'data\github-copilot')) 'Copilot data directory was not created.'
         Assert-True ($envBefore -match '(?m)^AI_STACK_HOME=.+/home/\.ai-stack$') 'The Docker-compatible home path was not generated.'
+        Assert-True ($envBefore -match '(?m)^AGENTMEMORY_CONSOLE_PORT=3114\r?$') 'Setup did not upgrade an existing environment with the Console port.'
+        Assert-True ($envBefore -match '(?m)^AGENTMEMORY_INJECT_CONTEXT=true\r?$') 'Setup did not enable context injection for an existing environment.'
+        Assert-True ($envBefore -match '(?m)^AGENTMEMORY_AUTO_COMPRESS=false\r?$') 'Setup did not keep per-observation auto-compression disabled.'
         $updatedCopilot = [System.IO.File]::ReadAllText($copilotConfig) | ConvertFrom-Json
         Assert-Equal (Join-Path $testDataPath 'agentmemory-mcp.ps1') $updatedCopilot.mcpServers.agentmemory.args[-1] 'Copilot retained the legacy launcher path.'
         Assert-True ([System.IO.File]::ReadAllText($codexConfig) -match [regex]::Escape($testDataPath.Replace('\', '\\'))) 'Codex retained the legacy launcher path.'
@@ -598,6 +620,8 @@ memory:
             $firstWrite = Set-AiStackManagedFile -Path $managedPath -Content 'first'
             $secondWrite = Set-AiStackManagedFile -Path $managedPath -Content 'first'
             $thirdWrite = Set-AiStackManagedFile -Path $managedPath -Content 'second'
+            $environmentHome = Join-Path $Root 'capture-home'
+            Set-AiStackAgentMemoryEnvironment -Home $environmentHome -Secret 'am_test' -Port 3111 -SkipWindowsAcl | Out-Null
             [pscustomobject]@{
                 PiFirst = $piFirst
                 PiSecond = $piSecond
@@ -622,6 +646,7 @@ memory:
                 ThirdWrite = $thirdWrite
                 ManagedContent = [System.IO.File]::ReadAllText($managedPath)
                 BackupCount = @(Get-ChildItem "$managedPath.ai-stack-backup-*").Count
+                EnvironmentContent = [System.IO.File]::ReadAllText((Join-Path $environmentHome '.agentmemory\.env'))
                 CaptureSource = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\scripts\CaptureInstall.ps1'))
             }
         } $tempRoot
@@ -656,6 +681,8 @@ memory:
         Assert-True ($result.FirstWrite -and -not $result.SecondWrite -and $result.ThirdWrite) 'Managed-file writes are not idempotent.'
         Assert-Equal 'second' $result.ManagedContent 'Managed file did not receive the new content.'
         Assert-Equal 1 $result.BackupCount 'Managed-file replacement did not create exactly one backup.'
+        Assert-True ($result.EnvironmentContent -match '(?m)^AGENTMEMORY_INJECT_CONTEXT=true\r?$') 'Native hooks do not receive context injection configuration.'
+        Assert-True ($result.EnvironmentContent -match '(?m)^AGENTMEMORY_AUTO_COMPRESS=false\r?$') 'Native hooks can enable expensive per-observation auto-compression.'
         Assert-True ($result.CaptureSource -match 'd60652a7058773fa9428fa720eda38942f12f014') 'Capture integrations are not pinned to the reviewed upstream commit.'
         Assert-Equal 20 ([regex]::Matches($result.CaptureSource, "[a-f0-9]{64}'").Count) 'Capture integration hashes are incomplete.'
         Assert-True ($result.CaptureSource -match 'chmod 600') 'WSL secret permissions are not enforced.'
@@ -675,7 +702,7 @@ memory:
             -HttpProbe { param($url) 200 }
         Assert-True ($results.Count -ge 5)
         Assert-True ($results.Status -notcontains 'FAIL')
-        Assert-Equal 2 @($results | Where-Object { $_.Name -in @('LiteLLM', 'AgentMemory') -and $_.Status -eq 'PASS' }).Count
+        Assert-Equal 3 @($results | Where-Object { $_.Name -in @('LiteLLM', 'AgentMemory', 'iii Console') -and $_.Status -eq 'PASS' }).Count
     }
 
     Invoke-Test 'Doctor fails when Docker is unavailable' {
@@ -684,7 +711,21 @@ memory:
             -DockerProbe { throw 'must not run' } `
             -HttpProbe { param($url) throw 'offline' }
         Assert-Equal 'FAIL' ($results | Where-Object Name -eq 'Docker CLI').Status
-        Assert-Equal 2 @($results | Where-Object { $_.Name -in @('LiteLLM', 'AgentMemory') -and $_.Status -eq 'WARN' }).Count
+        Assert-Equal 3 @($results | Where-Object { $_.Name -in @('LiteLLM', 'AgentMemory', 'iii Console') -and $_.Status -eq 'WARN' }).Count
+    }
+
+    Invoke-Test 'Doctor detects unhealthy console engine' {
+        $results = Invoke-AiStackDoctor `
+            -CommandProbe { param($name) $true } `
+            -DockerProbe { '29.2.1' } `
+            -HttpProbe {
+                param($url)
+                if ($url -like '*/api/engine/_console/health') {
+                    return [pscustomobject]@{ StatusCode = 200; Content = '{"status":"unhealthy"}' }
+                }
+                return 200
+            }
+        Assert-Equal 'WARN' ($results | Where-Object Name -eq 'iii Console').Status
     }
 }
 finally {

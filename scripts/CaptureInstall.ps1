@@ -246,9 +246,24 @@ function Set-AiStackAgentMemoryEnvironment {
     )
 
     $path = Join-Path $Home '.agentmemory\.env'
+    $stackValues = Get-DotEnvValues -Path $script:EnvPath
+    $injectContext = if ($stackValues.ContainsKey('AGENTMEMORY_INJECT_CONTEXT')) {
+        $stackValues['AGENTMEMORY_INJECT_CONTEXT'].ToLowerInvariant()
+    }
+    else {
+        'true'
+    }
+    $autoCompress = if ($stackValues.ContainsKey('AGENTMEMORY_AUTO_COMPRESS')) {
+        $stackValues['AGENTMEMORY_AUTO_COMPRESS'].ToLowerInvariant()
+    }
+    else {
+        'false'
+    }
     $content = @(
         "AGENTMEMORY_URL=http://localhost:$Port"
         "AGENTMEMORY_SECRET=$Secret"
+        "AGENTMEMORY_INJECT_CONTEXT=$injectContext"
+        "AGENTMEMORY_AUTO_COMPRESS=$autoCompress"
         ''
     ) -join "`n"
     $existingBackups = @(
@@ -850,8 +865,23 @@ function Test-AiStackCaptureEnvironment {
         return $false
     }
     $values = Get-DotEnvValues -Path $Path
+    $stackValues = Get-DotEnvValues -Path $script:EnvPath
+    $expectedInjectContext = if ($stackValues.ContainsKey('AGENTMEMORY_INJECT_CONTEXT')) {
+        $stackValues['AGENTMEMORY_INJECT_CONTEXT'].ToLowerInvariant()
+    }
+    else {
+        'true'
+    }
+    $expectedAutoCompress = if ($stackValues.ContainsKey('AGENTMEMORY_AUTO_COMPRESS')) {
+        $stackValues['AGENTMEMORY_AUTO_COMPRESS'].ToLowerInvariant()
+    }
+    else {
+        'false'
+    }
     return $values['AGENTMEMORY_URL'] -eq "http://localhost:$Port" -and
-        $values['AGENTMEMORY_SECRET'] -ceq $Secret
+        $values['AGENTMEMORY_SECRET'] -ceq $Secret -and
+        $values['AGENTMEMORY_INJECT_CONTEXT'] -ceq $expectedInjectContext -and
+        $values['AGENTMEMORY_AUTO_COMPRESS'] -ceq $expectedAutoCompress
 }
 
 function Get-AiStackCaptureDoctorResults {

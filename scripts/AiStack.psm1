@@ -402,6 +402,15 @@ function Initialize-AiStackConfiguration {
     $content = [System.IO.File]::ReadAllText($script:EnvPath)
     $values = Get-DotEnvValues -Path $script:EnvPath
 
+    foreach ($default in ([ordered]@{
+        AGENTMEMORY_CONSOLE_PORT = '3114'
+        AGENTMEMORY_INJECT_CONTEXT = 'true'
+        AGENTMEMORY_AUTO_COMPRESS = 'false'
+    }).GetEnumerator()) {
+        if (-not $values.ContainsKey($default.Key)) {
+            $content = Set-DotEnvValue -Content $content -Name $default.Key -Value $default.Value
+        }
+    }
     if ((-not $values.ContainsKey('LITELLM_MASTER_KEY')) -or
         [string]::IsNullOrWhiteSpace($values['LITELLM_MASTER_KEY']) -or
         $values['LITELLM_MASTER_KEY'] -eq 'change-me-generated-by-setup') {
@@ -1059,7 +1068,11 @@ function Invoke-AiStackDoctor {
         [scriptblock]$DockerProbe = { docker info --format '{{.ServerVersion}}' 2>$null },
         [scriptblock]$HttpProbe = {
             param($url)
-            (Invoke-WebRequest -UseBasicParsing -Uri $url -TimeoutSec 3).StatusCode
+            $response = Invoke-WebRequest -UseBasicParsing -Uri $url -TimeoutSec 3
+            [pscustomobject]@{
+                StatusCode = $response.StatusCode
+                Content = $response.Content
+            }
         }
     )
 
@@ -1115,13 +1128,30 @@ function Invoke-AiStackDoctor {
     $doctorValues = Get-DotEnvValues -Path $script:EnvPath
     $litellmPort = if ($doctorValues.ContainsKey('LITELLM_PORT')) { $doctorValues['LITELLM_PORT'] } else { '4000' }
     $agentMemoryPort = if ($doctorValues.ContainsKey('AGENTMEMORY_REST_PORT')) { $doctorValues['AGENTMEMORY_REST_PORT'] } else { '3111' }
+    $consolePort = if ($doctorValues.ContainsKey('AGENTMEMORY_CONSOLE_PORT')) { $doctorValues['AGENTMEMORY_CONSOLE_PORT'] } else { '3114' }
     foreach ($endpoint in @(
         @{ Name = 'LiteLLM'; Url = "http://127.0.0.1:$litellmPort/health/liveliness" },
-        @{ Name = 'AgentMemory'; Url = "http://127.0.0.1:$agentMemoryPort/agentmemory/livez" }
+        @{ Name = 'AgentMemory'; Url = "http://127.0.0.1:$agentMemoryPort/agentmemory/livez" },
+        @{ Name = 'iii Console'; Url = "http://127.0.0.1:$consolePort/api/engine/_console/health"; ExpectedJsonStatus = 'healthy' }
     )) {
         try {
-            $statusCode = & $HttpProbe $endpoint.Url
+            $probeResult = & $HttpProbe $endpoint.Url
+            $statusCode = if ($probeResult -is [int]) {
+                $probeResult
+            }
+            else {
+                $probeResult.StatusCode
+            }
             if ([int]$statusCode -eq 200) {
+                if ($endpoint.ContainsKey('ExpectedJsonStatus') -and
+                    $probeResult -isnot [int] -and
+                    $probeResult.Content) {
+                    $health = $probeResult.Content | ConvertFrom-Json
+                    if ($health.status -ne $endpoint.ExpectedJsonStatus) {
+                        [void]$results.Add((New-DoctorResult -Name $endpoint.Name -Status 'WARN' -Detail "engine health is '$($health.status)'"))
+                        continue
+                    }
+                }
                 [void]$results.Add((New-DoctorResult -Name $endpoint.Name -Status 'PASS' -Detail 'local health endpoint is responding'))
             }
             else {

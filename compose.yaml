@@ -52,6 +52,8 @@ services:
       OPENAI_MODEL: ${AGENTMEMORY_LLM_MODEL:-gpt-5.6-sol}
       EMBEDDING_PROVIDER: ${AGENTMEMORY_EMBEDDING_PROVIDER:-local}
       OPENAI_EMBEDDING_MODEL: text-embedding-3-small
+      AGENTMEMORY_INJECT_CONTEXT: ${AGENTMEMORY_INJECT_CONTEXT:-true}
+      AGENTMEMORY_AUTO_COMPRESS: ${AGENTMEMORY_AUTO_COMPRESS:-false}
       GRAPH_EXTRACTION_ENABLED: ${GRAPH_EXTRACTION_ENABLED:-true}
       CONSOLIDATION_ENABLED: ${CONSOLIDATION_ENABLED:-true}
       AGENTMEMORY_VIEWER_HOST: 0.0.0.0
@@ -79,6 +81,48 @@ services:
         max-file: "3"
     networks:
       - ai-stack
+
+  iii-console:
+    build:
+      context: ./docker/iii-console
+      args:
+        III_CONSOLE_VERSION: 0.22.1
+        III_CONSOLE_SHA256: b6c7f2ff6739d1142a156ff3cf6e7fb81593b96ccd7b4fa7671600962038cede
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${AGENTMEMORY_CONSOLE_PORT:-3114}:3114"
+    command:
+      - --port
+      - "3114"
+      - --host
+      - 0.0.0.0
+      - --engine-host
+      - agentmemory
+      - --engine-port
+      - "3111"
+      - --ws-port
+      - "3112"
+      - --bridge-port
+      - "49134"
+      - --no-otel
+    depends_on:
+      agentmemory:
+        condition: service_healthy
+    networks:
+      - ai-stack
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3114/api/engine/_console/health | grep -q '\"status\":\"healthy\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
 
   cloudflared:
     image: cloudflare/cloudflared:2026.7.3
