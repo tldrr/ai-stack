@@ -80,6 +80,13 @@ try {
         Assert-True ($compose -match '(?ms)^\s{2}agentmemory:.*?^\s{4}stop_grace_period:\s*30s') 'AgentMemory does not have enough time for state flush.'
     }
 
+    Invoke-Test 'LiteLLM persists all Copilot credential files' {
+        $compose = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'compose.yaml'))
+        Assert-True ($compose -match 'GITHUB_COPILOT_TOKEN_DIR:\s*/var/lib/litellm/github-copilot') 'LiteLLM does not write Copilot credentials to the mounted directory.'
+        Assert-True ($compose -match 'github-copilot-token:/var/lib/litellm/github-copilot') 'The Copilot credential directory is not a named volume.'
+        Assert-True ($compose -match '(?m)^\s{2}github-copilot-token:\s*$') 'The Copilot credential volume is not declared.'
+    }
+
     Invoke-Test 'Setup is idempotent and generates local secrets' {
         Initialize-AiStackConfiguration
         $envBefore = [System.IO.File]::ReadAllText((Join-Path $tempRoot '.env'))
@@ -128,13 +135,34 @@ try {
         Assert-True $failed 'Invalid hostnames were accepted.'
     }
 
+    Invoke-Test 'Empty Cloudflare tunnel lists are handled' {
+        $module = Get-Module AiStack
+        $emptyMatches = @(& $module {
+            @(Find-CloudflareTunnelsByName -Tunnels $null -Name 'ai-stack')
+        })
+        Assert-Equal 0 $emptyMatches.Count 'An empty tunnel list produced a match.'
+
+        $tunnels = @(
+            [pscustomobject]@{ name = 'other' },
+            [pscustomobject]@{ name = 'ai-stack' }
+        )
+        $matches = @(& $module {
+            param($items)
+            @(Find-CloudflareTunnelsByName -Tunnels $items -Name 'ai-stack')
+        } $tunnels)
+        Assert-Equal 1 $matches.Count 'The requested tunnel was not selected exactly once.'
+    }
+
     Invoke-Test 'Compose uses local Cloudflare config without a token' {
         $compose = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'compose.yaml'))
         $envExample = [System.IO.File]::ReadAllText((Join-Path $repoRoot '.env.example'))
+        $module = [System.IO.File]::ReadAllText($modulePath)
         Assert-True ($compose -match '\.state/cloudflared:/etc/cloudflared:ro') 'Cloudflare state is not mounted read-only.'
         Assert-True ($compose -match '/etc/cloudflared/config\.yml') 'Cloudflare config file is not used.'
         Assert-True ($compose -notmatch 'CLOUDFLARE_TUNNEL_TOKEN') 'Compose still depends on a remotely managed tunnel token.'
         Assert-True ($envExample -notmatch 'CLOUDFLARE_TUNNEL_TOKEN') '.env.example still requests a tunnel token.'
+        Assert-True ($module -match "Invoke-DockerCompose -Arguments @\('--profile', 'tunnel', 'down'\)") 'Stop does not include the tunnel profile.'
+        Assert-True ($module -match "\$arguments = @\('--profile', 'tunnel', 'down', '--remove-orphans'\)") 'Uninstall does not include the tunnel profile.'
     }
 
     Invoke-Test 'Copilot JSON merge preserves servers and is idempotent' {

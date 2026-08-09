@@ -317,6 +317,17 @@ function Get-CloudflareTunnelIdFromCredentials {
     return $parsedTunnelId.ToString()
 }
 
+function Find-CloudflareTunnelsByName {
+    param(
+        $Tunnels,
+        [Parameter(Mandatory = $true)][string]$Name
+    )
+
+    return @($Tunnels | Where-Object {
+        $null -ne $_ -and $_.PSObject.Properties['name'] -and $_.name -eq $Name
+    })
+}
+
 function Initialize-CloudflareTunnel {
     [CmdletBinding()]
     param()
@@ -367,7 +378,7 @@ function Initialize-CloudflareTunnel {
         catch {
             throw "cloudflared returned invalid tunnel list JSON: $($_.Exception.Message)"
         }
-        $matchingTunnels = @($tunnels | Where-Object { $_.name -eq $tunnelName })
+        $matchingTunnels = @(Find-CloudflareTunnelsByName -Tunnels $tunnels -Name $tunnelName)
         if ($matchingTunnels.Count -gt 0) {
             throw "Tunnel '$tunnelName' already exists but its local credentials are missing. Restore .state\cloudflared\credentials.json or choose a different CLOUDFLARE_TUNNEL_NAME."
         }
@@ -435,24 +446,24 @@ function Start-AiStack {
 
 function Stop-AiStack {
     Assert-AiStackEnvExists
-    Invoke-DockerCompose -Arguments @('down')
+    Invoke-DockerCompose -Arguments @('--profile', 'tunnel', 'down')
 }
 
 function Restart-AiStack {
     Initialize-AiStackConfiguration
-    Invoke-DockerCompose -Arguments @('restart')
+    Invoke-DockerCompose -Arguments @('--profile', 'tunnel', 'restart')
 }
 
 function Get-AiStackStatus {
     Assert-AiStackEnvExists
-    Invoke-DockerCompose -Arguments @('ps')
+    Invoke-DockerCompose -Arguments @('--profile', 'tunnel', 'ps')
 }
 
 function Show-AiStackLogs {
     param([string]$Service)
 
     Assert-AiStackEnvExists
-    $arguments = @('logs', '--follow', '--tail', '200')
+    $arguments = @('--profile', 'tunnel', 'logs', '--follow', '--tail', '200')
     if (-not [string]::IsNullOrWhiteSpace($Service)) {
         $arguments += $Service
     }
@@ -725,7 +736,7 @@ function Uninstall-AiStack {
     )
 
     Assert-AiStackEnvExists
-    $arguments = @('down', '--remove-orphans')
+    $arguments = @('--profile', 'tunnel', 'down', '--remove-orphans')
     if ($DeleteData) {
         if (-not $Force) {
             $answer = Read-Host 'This permanently deletes AgentMemory data and Copilot OAuth state. Type DELETE to continue'
