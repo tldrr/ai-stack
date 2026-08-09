@@ -65,6 +65,12 @@ try {
         Assert-Equal 0 $parseErrors.Count ($parseErrors -join [Environment]::NewLine)
     }
 
+    Invoke-Test 'AgentMemory image includes local embeddings' {
+        $dockerfile = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'docker\agentmemory\Dockerfile'))
+        Assert-True ($dockerfile -notmatch '--omit=optional') 'The image omits AgentMemory local embedding dependencies.'
+        Assert-True ($dockerfile -match '@agentmemory/agentmemory@\$\{AGENTMEMORY_VERSION\}') 'AgentMemory is not version-pinned at build time.'
+    }
+
     Invoke-Test 'Setup is idempotent and generates local secrets' {
         Initialize-AiStackConfiguration
         $envBefore = [System.IO.File]::ReadAllText((Join-Path $tempRoot '.env'))

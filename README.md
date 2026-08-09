@@ -100,7 +100,8 @@ AgentMemory calls LiteLLM at the internal URL `http://litellm:4000/v1`.
 Its default chat model is `gpt-5.6-sol`. Change
 `AGENTMEMORY_LLM_MODEL` in `.env` to another listed alias.
 
-Embeddings default to AgentMemory's local provider. To use OpenAI
+Embeddings default to AgentMemory's bundled local provider, so semantic search
+works without an external key. To use OpenAI
 `text-embedding-3-small`, set both values:
 
 ```dotenv
