@@ -114,6 +114,9 @@ function Test-AiStackDataVolumeExists {
     finally {
         $ErrorActionPreference = $previousErrorAction
     }
+    # An expected "volume not found" must not become the caller's process exit
+    # code when setup is run directly from CI or a shell.
+    $global:LASTEXITCODE = 0
     return $exists
 }
 
