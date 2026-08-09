@@ -16,13 +16,19 @@ RUN apt-get update \
 COPY --from=iii-image /app/iii /usr/local/bin/iii
 
 WORKDIR /opt/agentmemory
+COPY patch-import-index.mjs /tmp/patch-import-index.mjs
 RUN printf '{"name":"agentmemory-deploy","version":"1.0.0","private":true,"overrides":{"iii-sdk":"%s"}}\n' "${III_SDK_VERSION}" > package.json \
  && npm install "@agentmemory/agentmemory@${AGENTMEMORY_VERSION}" --no-fund --no-audit \
+ && node /tmp/patch-import-index.mjs /opt/agentmemory/node_modules/@agentmemory/agentmemory/dist \
+ && rm /tmp/patch-import-index.mjs \
+ && rm -rf /opt/agentmemory/node_modules/@xenova/transformers/.cache \
+ && ln -s /data/transformers-cache /opt/agentmemory/node_modules/@xenova/transformers/.cache \
  && ln -s /opt/agentmemory/node_modules/.bin/agentmemory /usr/local/bin/agentmemory
 
 ENV AGENTMEMORY_III_VERSION=${III_VERSION} \
     TINI_SUBREAPER=1
 
+COPY --chmod=0644 graph-backfill.mjs /opt/agentmemory/graph-backfill.mjs
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/agentmemory-entrypoint.sh
 RUN sed -i 's/\r$//' /usr/local/bin/agentmemory-entrypoint.sh
 

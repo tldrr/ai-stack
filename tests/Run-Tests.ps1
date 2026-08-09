@@ -59,6 +59,7 @@ try {
     $env:AI_STACK_TEST_ROOT = $tempRoot
     $env:AI_STACK_TEST_DATA_PATH = $testDataPath
     $env:AI_STACK_TEST_CLIENT_HOME = $testClientHome
+    $env:AI_STACK_TEST_DISABLE_WSL = '1'
     Import-Module $modulePath -Force
 
     Invoke-Test 'PowerShell files parse cleanly' {
@@ -72,10 +73,55 @@ try {
         Assert-Equal 0 $parseErrors.Count ($parseErrors -join [Environment]::NewLine)
     }
 
+    Invoke-Test 'Node scripts parse cleanly' {
+        $scripts = @(
+            (Join-Path $repoRoot 'scripts\read-copilot-sessions.mjs'),
+            (Join-Path $repoRoot 'scripts\enrich-agentmemory.mjs'),
+            (Join-Path $repoRoot 'docker\agentmemory\patch-import-index.mjs'),
+            (Join-Path $repoRoot 'docker\agentmemory\graph-backfill.mjs')
+        )
+        foreach ($script in $scripts) {
+            & node --check $script
+            Assert-Equal 0 $LASTEXITCODE "Node could not parse '$script'."
+        }
+    }
+
     Invoke-Test 'AgentMemory image includes local embeddings' {
         $dockerfile = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'docker\agentmemory\Dockerfile'))
+        $entrypoint = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'docker\agentmemory\entrypoint.sh'))
+        $importPatch = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'docker\agentmemory\patch-import-index.mjs'))
+        $graphBackfill = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'docker\agentmemory\graph-backfill.mjs'))
         Assert-True ($dockerfile -notmatch '--omit=optional') 'The image omits AgentMemory local embedding dependencies.'
         Assert-True ($dockerfile -match '@agentmemory/agentmemory@\$\{AGENTMEMORY_VERSION\}') 'AgentMemory is not version-pinned at build time.'
+        Assert-True ($dockerfile -match 'ln -s /data/transformers-cache') 'Transformers.js is not using the persistent writable cache.'
+        Assert-True ($entrypoint -match 'TRANSFORMERS_CACHE_DIR') 'The persistent Transformers.js cache is not initialized.'
+        Assert-True ($dockerfile -match 'patch-import-index\.mjs') 'The pinned 0.9.28 import index compatibility patch is not applied.'
+        Assert-True ($importPatch -match 'embedBatch') 'Imported observations are not added to the vector index in batches.'
+        Assert-True ($importPatch -match 'flushIndexSave') 'Imported search index updates are not persisted.'
+        Assert-True ($importPatch -match 'throw error') 'Embedding failures do not fail the import for a resumable retry.'
+        Assert-True ($importPatch -match 'idx\.remove\(memory\.id\)') 'Reimported memories leave stale BM25 postings.'
+        Assert-True ($importPatch -match 'idx\.remove\(observation\.id\)') 'Reimported observations leave stale BM25 postings.'
+        Assert-True ($importPatch -match 'vectorIndex\?\.remove\(memory\.id\)') 'Superseded memories leave stale vector entries.'
+        Assert-True ($importPatch -match 'vectorIndex\?\.remove\(observation\.id\)') 'Reimported observations leave stale vector entries.'
+        Assert-True ($importPatch -match 'currentMemories') 'Consolidated memories are not added to search indexes.'
+        Assert-True ($importPatch -match 'consolidationFailures') 'Base consolidation silently swallows partial failures.'
+        Assert-True ($importPatch -match 'mem:consolidation:completed') 'Partial consolidation retries duplicate successful memories.'
+        Assert-True ($importPatch -match 'resetDerived') 'Semantic and procedural memories cannot be rebuilt after source changes.'
+        Assert-True ($importPatch -match 'reflectionFailures') 'Reflection silently swallows partial failures.'
+        Assert-True ($importPatch -match 'kv\.list\(KV\.insights\)') 'Stale reflection insights survive derived-data rebuilds.'
+        Assert-True ($importPatch -match 'idRemap\.get\(rawEdge\.sourceNodeId\)') 'Merged graph nodes do not remap edge endpoints.'
+        Assert-True ($importPatch -match 'graphExtractionChain') 'Graph extraction writes are not serialized.'
+        Assert-True ($importPatch -match 'serialized graph snapshot rebuild') 'Graph snapshot rebuilds are not serialized with extraction.'
+        Assert-True ($importPatch -match 'serialized graph reset') 'Graph resets are not serialized with extraction.'
+        Assert-True ($importPatch -match 'rebuildResetAt') 'Snapshot rebuilds can restore pre-reset graph rows.'
+        Assert-True ($importPatch -match 'graphResetAt') 'MCP graph stats include pre-reset graph rows.'
+        Assert-True ($dockerfile -match 'graph-backfill\.mjs') 'The resumable graph backfill runner is not included in the image.'
+        Assert-True ($graphBackfill -match 'mem::graph-extract') 'Graph backfill does not use AgentMemory graph extraction.'
+        Assert-True ($graphBackfill -match 'graph-backfill-manifest\.json') 'Graph backfill is not resumable.'
+        Assert-True ($graphBackfill -match 'session\.summary') 'Graph backfill does not use source-grounded session summaries.'
+        Assert-True ($graphBackfill -match 'missingSummaries') 'Graph backfill can silently omit unsummarized sessions.'
+        Assert-True ($graphBackfill -match 'const sessions = allSessions\.filter') 'A graph reset cannot rebuild summarized live sessions.'
+        Assert-True ($graphBackfill -match 'invocationTimeoutMs:\s*900_000') 'Graph extraction can time out before the model returns.'
     }
 
     Invoke-Test 'AgentMemory shutdown preserves buffered state' {
@@ -85,6 +131,9 @@ try {
         Assert-True ($entrypoint -match 'trap shutdown TERM INT') 'The entrypoint does not handle Docker shutdown signals.'
         Assert-True ($entrypoint -match 'iii\.pid') 'The detached iii engine is not included in graceful shutdown.'
         Assert-True ($compose -match '(?ms)^\s{2}agentmemory:.*?^\s{4}stop_grace_period:\s*30s') 'AgentMemory does not have enough time for state flush.'
+        $module = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'scripts\AiStack.psm1'))
+        Assert-True ($module -match 'function Restart-AiStack[\s\S]*?@\(''up'', ''-d'', ''--build''\)') 'Restart does not rebuild a changed AgentMemory image.'
+        Assert-True ($module -match '\.permissions-v1') 'Windows ACL hardening is repeated against live database files.'
     }
 
     Invoke-Test 'Docker data persists under the local state directory' {
@@ -199,6 +248,10 @@ try {
         Assert-True ($envExample -notmatch 'CLOUDFLARE_TUNNEL_TOKEN') '.env.example still requests a tunnel token.'
         Assert-True ($module -match "Invoke-DockerCompose -Arguments @\('--profile', 'tunnel', 'down'\)") 'Stop does not include the tunnel profile.'
         Assert-True ($module -match "\$arguments = @\('--profile', 'tunnel', 'down', '--remove-orphans'\)") 'Uninstall does not include the tunnel profile.'
+        Assert-True ($module -match "\$arguments = @\('up', '-d', '--build'\)") 'Restart does not rebuild and recreate services when Compose configuration changes.'
+        Assert-True ($module -match "'ps', '--all', '--services'") 'Restart cannot recover a provisioned but exited tunnel.'
+        Assert-True ($module -match "\$runningServices -contains 'cloudflared'") 'Restart does not preserve an active tunnel profile.'
+        Assert-True ($module -match "'rm', '--stop', '--force', 'cloudflared'") 'Disabling the tunnel leaves an exited container that restart can re-enable.'
     }
 
     Invoke-Test 'Copilot JSON merge preserves servers and is idempotent' {
@@ -255,6 +308,200 @@ command = "old"
         }
     }
 
+    Invoke-Test 'Session import records are deterministic and redact secrets' {
+        $module = Get-Module AiStack
+        $result = & $module {
+            $messages = @(
+                (New-AiStackImportMessage `
+                    -Role 'user' `
+                    -Text "Use this token: Bearer abcdefghijklmnopqrstuvwxyz123456" `
+                    -Timestamp '2026-01-01T00:00:00Z'),
+                (New-AiStackImportMessage `
+                    -Role 'assistant' `
+                    -Text 'Completed without exposing credentials.' `
+                    -Timestamp '2026-01-01T00:00:01Z')
+            )
+            $first = New-AiStackNormalizedSession `
+                -Source 'VSCode' `
+                -SourceId 'workspace|session-1' `
+                -Project 'sample' `
+                -Cwd 'C:\sample' `
+                -Messages $messages
+            $second = New-AiStackNormalizedSession `
+                -Source 'VSCode' `
+                -SourceId 'workspace|session-1' `
+                -Project 'sample' `
+                -Cwd 'C:\sample' `
+                -Messages $messages
+            $firstExport = ConvertTo-AiStackAgentMemoryExport -Session $first
+            $secondExport = ConvertTo-AiStackAgentMemoryExport -Session $second
+            [pscustomobject]@{
+                FirstId = $first.Id
+                SecondId = $second.Id
+                FirstContentHash = $first.ContentHash
+                FirstObservationIds = @($firstExport.observations[$first.Id].id)
+                SecondObservationIds = @($secondExport.observations[$second.Id].id)
+                Narrative = $firstExport.observations[$first.Id][0].narrative
+                Importance = @($firstExport.observations[$first.Id].importance)
+                ImportContentHash = $firstExport.sessions[0].importContentHash
+                Tags = @($firstExport.sessions[0].tags)
+            }
+        }
+        Assert-Equal $result.FirstId $result.SecondId 'Session IDs changed for identical source data.'
+        Assert-Equal ($result.FirstObservationIds -join ',') ($result.SecondObservationIds -join ',') 'Observation IDs changed for identical source data.'
+        Assert-True ($result.Narrative -match 'Bearer \[REDACTED\]') 'Bearer token was not redacted.'
+        Assert-Equal '7,6' ($result.Importance -join ',') 'Imported observations do not use AgentMemory''s 1-10 importance scale.'
+        Assert-Equal $result.FirstContentHash $result.ImportContentHash 'The imported session does not carry its source content hash.'
+        Assert-True ($result.Tags -contains 'source-vscode') 'Source tag is missing.'
+    }
+
+    Invoke-Test 'Historical source adapters exclude hidden and sensitive content' {
+        $module = Get-Module AiStack
+        $oldAppData = $env:APPDATA
+        $oldLocalAppData = $env:LOCALAPPDATA
+        try {
+            $env:APPDATA = Join-Path $tempRoot 'appdata'
+            $env:LOCALAPPDATA = Join-Path $tempRoot 'localappdata'
+
+            $hermesRoot = Join-Path $env:LOCALAPPDATA 'hermes\sessions'
+            New-Item -ItemType Directory -Path $hermesRoot -Force | Out-Null
+            $hermes = @{
+                timestamp = '2026-01-01T00:00:00Z'
+                session_id = 'hermes-1'
+                request = @{
+                    headers = @{ Authorization = 'Bearer must-not-import' }
+                    body = @{
+                        model = 'test-model'
+                        messages = @(
+                            @{ role = 'system'; content = 'hidden system prompt' },
+                            @{ role = 'user'; content = 'hello from Hermes' },
+                            @{ role = 'assistant'; content = 'hello back' }
+                        )
+                    }
+                }
+            } | ConvertTo-Json -Depth 8
+            Set-Content -LiteralPath (Join-Path $hermesRoot 'session.json') -Value $hermes -Encoding UTF8
+            $hermesFollowUp = @{
+                timestamp = '2026-01-01T00:01:00Z'
+                session_id = 'hermes-1'
+                request = @{
+                    body = @{
+                        model = 'test-model'
+                        messages = @(
+                            @{ role = 'system'; content = 'hidden system prompt' },
+                            @{ role = 'user'; content = 'hello from Hermes' },
+                            @{ role = 'assistant'; content = 'hello back' },
+                            @{ role = 'user'; content = 'hello from Hermes' }
+                        )
+                    }
+                }
+            } | ConvertTo-Json -Depth 8
+            Set-Content `
+                -LiteralPath (Join-Path $hermesRoot 'session-follow-up.json') `
+                -Value $hermesFollowUp `
+                -Encoding UTF8
+            (Get-Item -LiteralPath (Join-Path $hermesRoot 'session.json')).LastWriteTimeUtc = [datetime]'2026-02-01T00:00:00Z'
+            (Get-Item -LiteralPath (Join-Path $hermesRoot 'session-follow-up.json')).LastWriteTimeUtc = [datetime]'2026-01-01T00:00:00Z'
+
+            $piRoot = Join-Path $testClientHome '.pi\agent\sessions\project'
+            New-Item -ItemType Directory -Path $piRoot -Force | Out-Null
+            @(
+                (@{ type = 'session'; id = 'pi-1'; cwd = 'C:\pi-project'; timestamp = '2026-01-02T00:00:00Z' } | ConvertTo-Json -Compress),
+                (@{ type = 'message'; message = @{ role = 'user'; content = 'hello from pi'; timestamp = '2026-01-02T00:00:01Z' } } | ConvertTo-Json -Compress),
+                (@{ type = 'message'; message = @{ role = 'assistant'; content = 'pi response'; timestamp = '2026-01-02T00:00:02Z' } } | ConvertTo-Json -Compress)
+            ) | Set-Content -LiteralPath (Join-Path $piRoot 'session.jsonl') -Encoding UTF8
+
+            $workspaceRoot = Join-Path $env:APPDATA 'Code\User\workspaceStorage\workspace-1'
+            $chatRoot = Join-Path $workspaceRoot 'chatSessions'
+            New-Item -ItemType Directory -Path $chatRoot -Force | Out-Null
+            @{ folder = 'file:///C:/work/sample-project' } |
+                ConvertTo-Json -Compress |
+                Set-Content -LiteralPath (Join-Path $workspaceRoot 'workspace.json') -Encoding UTF8
+            $chat = @{
+                kind = 0
+                v = @{
+                    sessionId = 'vscode-1'
+                    customTitle = 'temporary'
+                    requests = @(
+                        @{
+                            timestamp = 1767225600000
+                            modelId = 'test-model'
+                            message = @{ text = 'hello from VS Code' }
+                            response = @(
+                                @{ kind = 'thinking'; value = 'hidden reasoning' },
+                                @{ value = 'visible response' },
+                                @{ kind = 'toolInvocationSerialized'; value = 'hidden tool output' }
+                            )
+                        }
+                    )
+                }
+            }
+            $chatSet = @{
+                kind = 1
+                k = @('requests', 0, 'response')
+                v = @(@{ value = 'updated visible response' })
+            }
+            $chatPush = @{
+                kind = 2
+                k = @('requests')
+                v = @(@{
+                    timestamp = 1767225660000
+                    modelId = 'test-model'
+                    message = @{ text = 'second VS Code request' }
+                    response = @(@{ value = 'second VS Code response' })
+                })
+            }
+            $chatDelete = @{ kind = 3; k = @('customTitle') }
+            @($chat, $chatSet, $chatPush, $chatDelete) |
+                ForEach-Object { $_ | ConvertTo-Json -Depth 10 -Compress } |
+                Set-Content -LiteralPath (Join-Path $chatRoot 'session.jsonl') -Encoding UTF8
+
+            $result = & $module {
+                [pscustomobject]@{
+                    Hermes = @(Get-HermesImportSessions)
+                    Pi = @(Get-PiImportSessions)
+                    VSCode = @(Get-VSCodeImportSessions)
+                }
+            }
+            Assert-Equal 1 $result.Hermes.Count
+            Assert-Equal 3 $result.Hermes[0].Messages.Count
+            Assert-Equal 2 @($result.Hermes[0].Messages | Where-Object Text -eq 'hello from Hermes').Count 'Hermes repeated messages were discarded.'
+            Assert-True (($result.Hermes[0].Messages.Text -join ' ') -notmatch 'system prompt|must-not-import') 'Hermes metadata or system prompts leaked into the import.'
+            Assert-Equal 1 $result.Pi.Count
+            Assert-Equal 2 $result.Pi[0].Messages.Count
+            Assert-Equal 1 $result.VSCode.Count
+            Assert-Equal 4 $result.VSCode[0].Messages.Count
+            Assert-True (($result.VSCode[0].Messages.Text -join ' ') -match 'updated visible response|second VS Code request') 'VS Code mutation log entries were not replayed.'
+            Assert-True (($result.VSCode[0].Messages.Text -join ' ') -notmatch 'hidden reasoning|hidden tool output') 'VS Code hidden content leaked into the import.'
+        }
+        finally {
+            $env:APPDATA = $oldAppData
+            $env:LOCALAPPDATA = $oldLocalAppData
+        }
+    }
+
+    Invoke-Test 'Historical enrichment is resumable and WSL-safe' {
+        $launcher = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'ai-stack.ps1'))
+        $importer = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'scripts\SessionImport.ps1'))
+        $summaryRunner = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'scripts\enrich-agentmemory.mjs'))
+        Assert-True ($launcher -match "'enrich-sessions'") 'The enrichment command is not exposed by the launcher.'
+        Assert-True ($importer -match '__AI_STACK_HOME__') 'WSL home discovery does not isolate shell startup output.'
+        Assert-True ($importer -match 'Invoke-AiStackSessionEnrichment') 'Historical enrichment is not wired into the module.'
+        Assert-True ($summaryRunner -match 'alreadySummarized') 'Existing summaries are not skipped on resume.'
+        Assert-True ($summaryRunner -match 'importContentHash') 'Summary checkpoints do not invalidate changed transcripts.'
+        Assert-True ($summaryRunner -match 'historical-import') 'Enrichment is not restricted to historical imports.'
+        Assert-True ($importer -match '\$staleIds\.Count -gt 0 -or \$sessionContentChanged') 'Append-only transcript changes do not invalidate derived data.'
+        Assert-True ($importer -match '\$SessionIds\.Count -eq 0 -and \$ObservationIds\.Count -eq 0') 'Append-only transcript invalidation exits before clearing derived data.'
+        Assert-True ($importer -match 'ConsolidationManifestPath') 'Failed consolidation cannot be resumed independently.'
+        Assert-True ($importer -match '\$pipelineErrors\.Count -gt 0') 'Partial consolidation pipeline failures are checkpointed as success.'
+        Assert-True ($importer -match '\$Force -and -not \$DryRun') 'Forced summary regeneration does not reset the graph.'
+        Assert-True ($importer -match 'resetDerived = \(-not \$consolidationCurrent -or \$Force\)') 'Resumed enrichment preserves stale derived tiers.'
+        Assert-True ($importer -match 'Fallback \$turnFallback') 'Copilot turns without timestamps are not deterministic.'
+        $invalidationWrite = $importer.IndexOf('$script:DerivedInvalidationPath', $importer.IndexOf('$staleIds.Count -gt 0'))
+        $manifestWrite = $importer.IndexOf('Write-AiStackImportManifest -Entries $manifest', $importer.IndexOf('$staleIds.Count -gt 0'))
+        Assert-True ($invalidationWrite -ge 0 -and $invalidationWrite -lt $manifestWrite) 'Derived-data invalidation is checkpointed after the import manifest.'
+    }
+
     Invoke-Test 'Doctor reports healthy injected probes' {
         $results = Invoke-AiStackDoctor `
             -CommandProbe { param($name) $true } `
@@ -279,6 +526,7 @@ finally {
     Remove-Item Env:\AI_STACK_TEST_ROOT -ErrorAction SilentlyContinue
     Remove-Item Env:\AI_STACK_TEST_DATA_PATH -ErrorAction SilentlyContinue
     Remove-Item Env:\AI_STACK_TEST_CLIENT_HOME -ErrorAction SilentlyContinue
+    Remove-Item Env:\AI_STACK_TEST_DISABLE_WSL -ErrorAction SilentlyContinue
     if ($null -ne $previousComposeProjectName) {
         $env:COMPOSE_PROJECT_NAME = $previousComposeProjectName
     }

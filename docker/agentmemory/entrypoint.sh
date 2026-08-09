@@ -5,6 +5,7 @@
 set -eu
 
 DATA_DIR="${AGENTMEMORY_DATA_DIR:-/data}"
+TRANSFORMERS_CACHE_DIR="${AGENTMEMORY_TRANSFORMERS_CACHE_DIR:-$DATA_DIR/transformers-cache}"
 HMAC_FILE="${AGENTMEMORY_HMAC_FILE:-/data/.hmac}"
 SECRET_FILE="${AGENTMEMORY_SECRET_FILE:-/run/secrets/agentmemory-secret}"
 III_PID_FILE="/home/node/.agentmemory/iii.pid"
@@ -13,7 +14,7 @@ III_CONFIG="/opt/agentmemory/node_modules/@agentmemory/agentmemory/dist/iii-conf
 
 export AGENTMEMORY_DATA_DIR="$DATA_DIR"
 
-mkdir -p "$DATA_DIR"
+mkdir -p "$DATA_DIR" "$TRANSFORMERS_CACHE_DIR"
 chown -R "$RUN_AS" "$DATA_DIR"
 
 cat > "$III_CONFIG" <<'EOF'

@@ -91,16 +91,21 @@ ACL-restricted `%USERPROFILE%\.ai-stack` directory, independent of the clone.
 | `configure-tunnel` | Creates a locally managed tunnel, DNS routes, credentials, and config file |
 | `start [-Tunnel]` | Builds and starts the stack, optionally including Cloudflare |
 | `stop` | Stops containers without deleting credentials or memories |
-| `restart` | Restarts running services |
+| `restart` | Reconciles Compose configuration and recreates changed services |
 | `status` | Shows Compose service state |
 | `doctor` | Checks Docker, local config, Node, and health endpoints |
 | `logs [-Service ...]` | Follows redacted-by-design service logs |
 | `install-clients` | Merges MCP config and installs official upstream plugins |
+| `import-sessions [-Source ...] [-DryRun]` | Backfills supported local conversation histories into AgentMemory |
+| `enrich-sessions [-Source ...] [-DryRun]` | Resumably summarizes imports, builds graph batches, and consolidates memory |
 | `uninstall` | Removes containers/network but preserves `~\.ai-stack` |
 | `uninstall -DeleteData` | Deletes AgentMemory and Copilot data after typing `DELETE` |
 
-`-Force` allows non-interactive data deletion and should be used only in
-automation that intentionally discards all memories and Copilot login state.
+For `uninstall`, `-Force` allows non-interactive data deletion and should be
+used only in automation that intentionally discards all memories and Copilot
+login state. For `import-sessions`, it reprocesses unchanged sessions without
+creating duplicate observation IDs. For `enrich-sessions`, it regenerates
+summaries and reruns consolidation; completed graph batches remain checkpointed.
 
 Upgrades from older ai-stack releases are automatic. Stop the old stack, then
 run `setup`; the command moves root `.env`/`.state` files and copies the two
@@ -117,6 +122,9 @@ bridge OpenAI Chat Completions callers correctly.
 AgentMemory calls LiteLLM at the internal URL `http://litellm:4000/v1`.
 Its default chat model is `gpt-5.6-sol`. Change
 `AGENTMEMORY_LLM_MODEL` in `~\.ai-stack\.env` to another listed alias.
+Knowledge-graph extraction and memory consolidation are enabled by default.
+Historical imports retain every source observation first; summaries, durable
+memories, and graph nodes are derived in a separate enrichment pass.
 
 Embeddings default to AgentMemory's bundled local provider, so semantic search
 works without an external key. To use OpenAI
@@ -169,6 +177,69 @@ workaround modifies global hooks and is not run automatically by ai-stack.
 This is a **local MCP** design: the desktop/CLI launches a stdio process, and
 that process calls AgentMemory REST on localhost. It is not a public,
 Streamable HTTP MCP server.
+
+## Historical session import
+
+Preview every supported local store before importing:
+
+```powershell
+.\ai-stack.ps1 import-sessions -Source All -DryRun
+.\ai-stack.ps1 import-sessions -Source All
+.\ai-stack.ps1 enrich-sessions -Source All -DryRun
+.\ai-stack.ps1 enrich-sessions -Source All
+```
+
+Use `-Source Hermes`, `Pi`, `Copilot`, or `VSCode` to process one source. The
+VS Code adapter discovers every Stable/Insiders profile, folder workspace, and
+empty-window chat store automatically, so no workspace list is required.
+The pi adapter also discovers every non-Docker WSL distribution and recursively
+scans the default user's `~/.pi/agent/sessions` tree.
+
+| Source | Local history used |
+| --- | --- |
+| Hermes | `%LOCALAPPDATA%\hermes\sessions\*.json` |
+| pi | Windows and non-Docker WSL `~/.pi/agent/sessions/**/*.jsonl` |
+| Copilot CLI/app | `%USERPROFILE%\.copilot\session-store.db` |
+| VS Code Copilot Chat | `%APPDATA%\Code*\User\...\chatSessions\*.jsonl` |
+
+The import is resumable and idempotent. Stable IDs are derived from the native
+source/session IDs, a manifest containing hashes and observation IDs is kept
+at `~\.ai-stack\imports\manifest.json`, and changed sessions remove superseded
+observations. Summary checkpoints also include the source content hash; edited
+transcripts are resummarized, their affected derived memories are removed, and
+the graph is rebuilt from checkpointed batches. Metadata-only or empty sessions
+are skipped. Node.js 22 or newer is required only for reading Copilot's SQLite
+session store. VS Code append-only mutation logs are replayed to reconstruct the
+latest complete chat state.
+
+Only user and assistant text is imported. The adapters exclude request
+headers, cookies, hidden system/developer prompts, VS Code thinking blocks,
+tool inputs/results, error payloads, and attachments. Common token, key,
+password, JWT, and private-key patterns are redacted as a defense in depth;
+this is not a guarantee that arbitrary secrets embedded in prose will be
+detected.
+
+With the default local embedding provider, conversion and indexing do not send
+transcripts to an external LLM. If
+`AGENTMEMORY_EMBEDDING_PROVIDER=openai` is configured, imported text is sent
+through the configured OpenAI embedding route. Imported work history becomes
+available to every client sharing this AgentMemory instance, so apply the same
+company data-handling rules to `~\.ai-stack` and its backups. Re-run the import
+command to capture new VS Code history; Copilot CLI/app sessions created after
+plugin installation are also captured live by the official AgentMemory hooks.
+
+Bulk import intentionally stores and indexes observations without impersonating
+a live session-stop event. Run `enrich-sessions` afterward to summarize each
+session from its observation text, extract AgentMemory graph nodes and edges in
+checkpointed adaptive batches of up to 20 source-grounded session summaries,
+and run durable-memory consolidation. The summaries make the graph less noisy;
+all original observations remain independently searchable and retrievable.
+Because AgentMemory's graph reset is global, a rebuild includes every available
+summarized session—including live sessions—rather than discarding unrelated
+knowledge when one historical source changes.
+Rerunning the command skips existing summaries and graph batches. Graph
+checkpoints contain hashes and IDs—not transcript text—and persist with the
+AgentMemory data directory.
 
 ## Optional Cloudflare Tunnel
 
@@ -234,6 +305,8 @@ ChatGPT connector.
   engine, with a 30-second grace period for buffered state to reach `/data`.
 - Copilot OAuth state lives in `~\.ai-stack\data\github-copilot`.
 - AgentMemory memories and indexes live in `~\.ai-stack\data\agentmemory`.
+- Historical import hashes live in `~\.ai-stack\imports`; transcript text is
+  written only to AgentMemory's data directory, not the manifest.
 - All host ports use explicit loopback bindings.
 - The viewer rejects unexpected Host headers and requires bearer auth for API
   calls because it binds to the private container network for tunnel support.
@@ -309,6 +382,18 @@ directory under `~\.ai-stack\data` forces a new login.
 `~\.ai-stack\agentmemory-secret` exists without printing it. AgentMemory starts
 independently while LiteLLM waits for first-time Copilot device authorization.
 
+**Imported sessions are missing:** run `import-sessions -DryRun` first. Empty
+session metadata is intentionally ignored. Copilot history also requires
+Node.js 22+, and VS Code must have persisted the chat under its user profile.
+Use `import-sessions -Force` to reconcile a repaired or restored AgentMemory
+data directory.
+
+**Imported sessions have no summaries or graph:** feature flags enable live
+session-stop enrichment but do not retroactively process bulk imports. Run
+`enrich-sessions -DryRun`, followed by `enrich-sessions`. If a model or circuit
+breaker temporarily fails, rerun the command; completed summaries and graph
+batches are skipped.
+
 **MCP silently exposes only a few tools:** the official shim falls back to a
 small local mode if `http://localhost:3111/agentmemory/livez` is unreachable.
 Run `doctor`; with the stack reachable, `AGENTMEMORY_TOOLS=all` exposes the full
@@ -336,10 +421,15 @@ Run the dependency-free PowerShell test suite:
 
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1
+node --check .\scripts\read-copilot-sessions.mjs
+node --check .\docker\agentmemory\patch-import-index.mjs
 .\ai-stack.ps1 setup
 docker compose --env-file "$HOME/.ai-stack/.env" -f compose.yaml config --quiet
 ```
 
 The AgentMemory image follows the upstream Coolify all-in-one pattern from
 commit `d60652a7058773fa9428fa720eda38942f12f014`, with a local Docker-secret
-adaptation so clients and the container share one non-logged credential.
+adaptation so clients and the container share one non-logged credential. The
+image also applies a build-time-verified compatibility patch to the published
+0.9.28 bundle so JSON imports receive the BM25/vector indexing behavior present
+in the pinned upstream source revision.

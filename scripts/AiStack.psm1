@@ -135,11 +135,15 @@ function Protect-AiStackData {
     if ($LASTEXITCODE -ne 0) {
         throw 'Failed to grant restricted permissions on .ai-stack.'
     }
-    foreach ($item in Get-ChildItem -LiteralPath $script:DataPath -Recurse -Force) {
-        & $icacls.Source $item.FullName /reset /Q | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to inherit restricted permissions on '$($item.FullName)'."
+    $permissionMarker = Join-Path $script:DataPath '.permissions-v1'
+    if (-not (Test-Path -LiteralPath $permissionMarker)) {
+        foreach ($item in Get-ChildItem -LiteralPath $script:DataPath -Recurse -Force) {
+            & $icacls.Source $item.FullName /reset /Q 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0 -and (Test-Path -LiteralPath $item.FullName)) {
+                throw "Failed to inherit restricted permissions on '$($item.FullName)'."
+            }
         }
+        Write-Utf8NoBom -Path $permissionMarker -Content "1$([Environment]::NewLine)"
     }
 }
 
@@ -715,8 +719,9 @@ function Start-AiStack {
     }
     else {
         # Calling start without -Tunnel also closes any previously enabled
-        # public tunnel instead of leaving stale exposure running.
-        Invoke-DockerCompose -Arguments @('--profile', 'tunnel', 'stop', 'cloudflared')
+        # public tunnel. Removing its container records that this was an
+        # intentional disable, while restart can still recover crashed tunnels.
+        Invoke-DockerCompose -Arguments @('--profile', 'tunnel', 'rm', '--stop', '--force', 'cloudflared')
     }
     Invoke-DockerCompose -Arguments $arguments
 }
@@ -728,7 +733,16 @@ function Stop-AiStack {
 
 function Restart-AiStack {
     Initialize-AiStackConfiguration
-    Invoke-DockerCompose -Arguments @('--profile', 'tunnel', 'restart')
+    $runningServices = @(
+        Invoke-DockerCompose `
+            -Arguments @('--profile', 'tunnel', 'ps', '--all', '--services') `
+            -Capture
+    )
+    $arguments = @('up', '-d', '--build')
+    if ($runningServices -contains 'cloudflared') {
+        $arguments = @('--profile', 'tunnel') + $arguments
+    }
+    Invoke-DockerCompose -Arguments $arguments
 }
 
 function Get-AiStackStatus {
@@ -1157,6 +1171,8 @@ function Uninstall-AiStack {
     }
 }
 
+. (Join-Path $PSScriptRoot 'SessionImport.ps1')
+
 Export-ModuleMember -Function @(
     'Get-DotEnvValues',
     'Initialize-AiStackConfiguration',
@@ -1171,5 +1187,7 @@ Export-ModuleMember -Function @(
     'Get-AiStackStatus',
     'Show-AiStackLogs',
     'Install-AiStackClients',
+    'Import-AiStackSessions',
+    'Invoke-AiStackSessionEnrichment',
     'Uninstall-AiStack'
 )
