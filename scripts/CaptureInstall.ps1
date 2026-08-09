@@ -450,9 +450,12 @@ function Install-AiStackCopilotCapture {
     Set-AiStackManagedFile `
         -Path $manifestPath `
         -Content (Get-AiStackPinnedIntegration -Path 'plugin/plugin.json') | Out-Null
-    Set-AiStackManagedFile `
-        -Path (Join-Path $pluginRoot '.mcp.copilot.json') `
-        -Content (Get-AiStackCopilotPluginMcpConfig -LauncherPath $script:McpLauncherPath) | Out-Null
+    $pluginMcpConfig = Get-AiStackCopilotPluginMcpConfig -LauncherPath $script:McpLauncherPath
+    foreach ($mcpFile in @('.mcp.copilot.json', '.mcp.json')) {
+        Set-AiStackManagedFile `
+            -Path (Join-Path $pluginRoot $mcpFile) `
+            -Content $pluginMcpConfig | Out-Null
+    }
     Sync-AiStackPinnedSkills -PluginRoot $pluginRoot
     foreach ($scriptName in $script:CopilotHookScripts) {
         Set-AiStackManagedFile `
@@ -884,14 +887,23 @@ function Get-AiStackCaptureDoctorResults {
             $pluginRoot = if ($entry.Count -eq 1) { [string]$entry[0].cache_path } else { '' }
             $runner = if ($pluginRoot) { Join-Path $pluginRoot 'scripts\ai-stack-runner.mjs' } else { '' }
             $hooks = if ($pluginRoot) { Join-Path $pluginRoot 'hooks\hooks.copilot.json' } else { '' }
-            $pluginMcp = if ($pluginRoot) { Join-Path $pluginRoot '.mcp.copilot.json' } else { '' }
+            $pluginMcpPaths = if ($pluginRoot) {
+                @('.mcp.copilot.json', '.mcp.json') | ForEach-Object {
+                    Join-Path $pluginRoot $_
+                }
+            }
+            else {
+                @()
+            }
             $runnerValid = $runner -and
                 (Test-Path -LiteralPath $runner -PathType Leaf) -and
                 (Get-Content -LiteralPath $runner -Raw -Encoding UTF8) -ceq (Get-AiStackCopilotEnvironmentRunner)
-            $mcpValid = $pluginMcp -and
-                (Test-Path -LiteralPath $pluginMcp -PathType Leaf) -and
-                (Get-Content -LiteralPath $pluginMcp -Raw -Encoding UTF8) -ceq
-                    (Get-AiStackCopilotPluginMcpConfig -LauncherPath $script:McpLauncherPath)
+            $expectedMcpConfig = Get-AiStackCopilotPluginMcpConfig -LauncherPath $script:McpLauncherPath
+            $mcpValid = $pluginMcpPaths.Count -eq 2 -and
+                @($pluginMcpPaths | Where-Object {
+                    -not (Test-Path -LiteralPath $_ -PathType Leaf) -or
+                    (Get-Content -LiteralPath $_ -Raw -Encoding UTF8) -cne $expectedMcpConfig
+                }).Count -eq 0
             $hooksValid = $false
             if ($runnerValid -and (Test-Path -LiteralPath $hooks -PathType Leaf)) {
                 $hooksDocument = Get-Content -LiteralPath $hooks -Raw -Encoding UTF8 | ConvertFrom-Json

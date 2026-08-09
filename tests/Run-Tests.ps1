@@ -524,6 +524,8 @@ type TextBlock = { type?: string; text?: string };
                 -Content $copilotFirst `
                 -RunnerPath $copilotRunnerPath
             $copilotRunner = Get-AiStackCopilotEnvironmentRunner
+            $copilotMcp = Get-AiStackCopilotPluginMcpConfig `
+                -LauncherPath 'C:\capture\agentmemory-mcp.ps1'
 
             $hermesSource = @"
 model:
@@ -602,6 +604,7 @@ memory:
                 CopilotFirst = $copilotFirst
                 CopilotSecond = $copilotSecond
                 CopilotRunner = $copilotRunner
+                CopilotMcp = $copilotMcp
                 HermesFirst = $hermesFirst
                 HermesSecond = $hermesSecond
                 NestedHermes = $nestedHermes
@@ -631,6 +634,10 @@ memory:
         Assert-True ($result.CopilotFirst -match 'session-start\.mjs') 'Copilot hook lost its official script target.'
         Assert-True ($result.CopilotRunner -notmatch 'AGENTMEMORY_SECRET=') 'Copilot hook runner embeds an AgentMemory secret.'
         Assert-True ($result.CopilotRunner -match '\.agentmemory') 'Copilot hook runner does not load the protected local environment.'
+        $copilotMcp = $result.CopilotMcp | ConvertFrom-Json
+        Assert-Equal 'powershell.exe' $copilotMcp.mcpServers.agentmemory.command 'Copilot plugin MCP does not use the authenticated launcher.'
+        Assert-True (@($copilotMcp.mcpServers.agentmemory.args) -contains 'C:\capture\agentmemory-mcp.ps1') 'Copilot plugin MCP launcher path is missing.'
+        Assert-True ($result.CopilotMcp -notmatch 'AGENTMEMORY_SECRET') 'Copilot plugin MCP embeds an AgentMemory secret.'
         Assert-Equal $result.HermesFirst $result.HermesSecond 'Hermes memory-provider merge is not idempotent.'
         Assert-True ($result.HermesFirst -match '(?m)^  provider: agentmemory$') 'Hermes provider was not selected.'
         Assert-True ($result.HermesFirst -match '(?m)^unrelated:\r?$') 'Hermes unrelated configuration was removed.'
@@ -655,6 +662,7 @@ memory:
         Assert-True ($result.CaptureSource -match 'SkipIfUnavailable:\(\$Agent -eq ''All''\)') 'An unavailable Copilot installation blocks other capture agents.'
         Assert-True ($result.CaptureSource -match 'Get-AiStackCopilotPluginMcpConfig') 'Copilot plugin MCP execution is not routed through the pinned launcher.'
         Assert-True ($result.CaptureSource -notmatch "args\s*=\s*@\(''-y'',\s*''@agentmemory/mcp''") 'Copilot plugin MCP still uses an unpinned package.'
+        Assert-True ($result.CaptureSource -match "@\('\.mcp\.copilot\.json', '\.mcp\.json'\)") 'Both Copilot plugin MCP descriptors are not managed.'
         Assert-True ($result.CaptureSource -match '\.env\.ai-stack-backup-\*') 'AgentMemory secret backups are not protected.'
         Assert-True ($result.CaptureSource -match 'Sync-AiStackPinnedSkills') 'Copilot plugin skills are not pinned.'
         Assert-True ($result.CaptureSource -match '\$Agent -ne ''All''') 'All-agent installation failures are not isolated.'

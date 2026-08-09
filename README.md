@@ -205,8 +205,10 @@ Copilot, Hermes, and pi read the local URL and bearer from
 its Linux home with mode `0600`. The installer generates these local,
 gitignored files from `~\.ai-stack\agentmemory-secret`; it never writes the
 bearer into a plugin source file or agent configuration. Copilot's official
-hooks are routed through a generated dotenv runner because hook subprocesses do
-not inherit the MCP launcher's environment. Hermes'
+plugin MCP descriptors are both routed through the authenticated, pinned local
+launcher because Copilot versions may resolve either descriptor. Its hooks are
+routed through a generated dotenv runner because hook subprocesses do not
+inherit the MCP launcher's environment. Hermes'
 `memory.provider` key is merged without replacing unrelated YAML. pi relies on
 its normal `~/.pi/agent/extensions` auto-discovery, so existing settings are not
 rewritten. The pinned Hermes provider receives a one-line Windows compatibility
@@ -439,6 +441,11 @@ batches are skipped.
 small local mode if `http://localhost:3111/agentmemory/livez` is unreachable.
 Run `doctor`; with the stack reachable, `AGENTMEMORY_TOOLS=all` exposes the full
 REST-backed tool set.
+
+**MCP tools return empty results while the viewer contains memories:** rerun
+`install-capture -Agent Copilot`, fully restart Copilot, and run `doctor`. This
+repairs both plugin MCP descriptors so the shim receives the local bearer
+through the generated launcher.
 
 **New conversations are not captured:** rerun `install-capture -Agent <name>`
 after an agent update, then fully restart that agent. For pi, confirm its active
