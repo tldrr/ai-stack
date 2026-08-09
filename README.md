@@ -16,27 +16,36 @@ Prerequisites:
 - Windows 11 with Docker Desktop using WSL2 and mirrored networking
 - Windows PowerShell 5.1 or newer
 - A GitHub account with Copilot model access
-- Node.js 20 or newer for the AgentMemory MCP shim
-- GitHub Copilot CLI and/or Codex CLI when installing client plugins
+- Git and Node.js 22 or newer
+
+Install the client CLIs you use, clone the repository, and allow scripts for
+the current PowerShell process:
 
 ```powershell
+winget install --id GitHub.Copilot --exact
+winget install --id OpenAI.Codex --exact
+
 git clone https://github.com/tldrr/ai-stack.git
 cd ai-stack
+Set-ExecutionPolicy -Scope Process Bypass -Force
+
 .\ai-stack.ps1 setup
 .\ai-stack.ps1 start
-.\ai-stack.ps1 logs -Service litellm
-```
-
-The first Copilot model request starts GitHub's device flow. Follow the
-verification URL and code in the LiteLLM logs. The OAuth credential persists
-under `%USERPROFILE%\.ai-stack\data\github-copilot`.
-
-Install memory integration after the stack is healthy:
-
-```powershell
 .\ai-stack.ps1 doctor
 .\ai-stack.ps1 install-clients
 ```
+
+The client CLI commands are optional when that client is not used. Setup stores
+all generated state in `%USERPROFILE%\.ai-stack`. The first Copilot model
+request starts GitHub's device flow; watch the logs and follow the displayed
+verification URL and code:
+
+```powershell
+.\ai-stack.ps1 logs -Service litellm
+```
+
+The OAuth credential persists under
+`%USERPROFILE%\.ai-stack\data\github-copilot`.
 
 Restart Copilot CLI, the GitHub Copilot app, Codex CLI, and ChatGPT/Codex
 desktop after installation. Desktop apps may require an explicit plugin trust
@@ -171,10 +180,12 @@ generated config file, not dashboard state:
 | `CLOUDFLARE_REST_HOSTNAME` | `http://agentmemory:3111` |
 | `CLOUDFLARE_VIEWER_HOSTNAME` | `http://agentmemory:3113` |
 
-Install `cloudflared`, set `CLOUDFLARE_TUNNEL_NAME` and both hostnames in
-`~\.ai-stack\.env`, then run:
+Install `cloudflared`, open the generated configuration, set
+`CLOUDFLARE_TUNNEL_NAME` and both hostnames, then create and start the tunnel:
 
 ```powershell
+winget install --id Cloudflare.cloudflared --exact
+.\ai-stack.ps1 configure
 .\ai-stack.ps1 configure-tunnel
 .\ai-stack.ps1 start -Tunnel
 ```
