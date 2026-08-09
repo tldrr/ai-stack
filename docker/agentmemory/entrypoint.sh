@@ -80,7 +80,7 @@ fi
 if [ -s "$HMAC_FILE" ]; then
   if ! cmp -s "$SECRET_FILE" "$HMAC_FILE"; then
     echo "agentmemory: local secret does not match the persistent /data/.hmac" >&2
-    echo "Restore the matching .state/agentmemory-secret or reset the data volume." >&2
+    echo "Restore the matching host agentmemory-secret or reset the data directory." >&2
     exit 1
   fi
 else

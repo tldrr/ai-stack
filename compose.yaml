@@ -12,7 +12,9 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
     volumes:
       - ./config/litellm.yaml:/app/config.yaml:ro
-      - github-copilot-token:/var/lib/litellm/github-copilot
+      - type: bind
+        source: ${AI_STACK_HOME:?Run .\ai-stack.ps1 setup first}/data/github-copilot
+        target: /var/lib/litellm/github-copilot
     command: ["--config", "/app/config.yaml", "--port", "4000"]
     healthcheck:
       test:
@@ -56,7 +58,9 @@ services:
     secrets:
       - agentmemory-secret
     volumes:
-      - agentmemory-data:/data
+      - type: bind
+        source: ${AI_STACK_HOME:?Run .\ai-stack.ps1 setup first}/data/agentmemory
+        target: /data
     depends_on:
       litellm:
         condition: service_started
@@ -85,7 +89,10 @@ services:
       - --no-autoupdate
       - run
     volumes:
-      - ./.state/cloudflared:/etc/cloudflared:ro
+      - type: bind
+        source: ${AI_STACK_HOME:?Run .\ai-stack.ps1 setup first}/cloudflared
+        target: /etc/cloudflared
+        read_only: true
     depends_on:
       agentmemory:
         condition: service_healthy
@@ -94,11 +101,7 @@ services:
 
 secrets:
   agentmemory-secret:
-    file: ./.state/agentmemory-secret
-
-volumes:
-  agentmemory-data:
-  github-copilot-token:
+    file: "${AI_STACK_HOME:?Run .\\ai-stack.ps1 setup first}/agentmemory-secret"
 
 networks:
   ai-stack:

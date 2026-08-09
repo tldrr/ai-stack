@@ -40,6 +40,8 @@ function Assert-Equal {
 
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("ai-stack-tests-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
+$previousComposeProjectName = [Environment]::GetEnvironmentVariable('COMPOSE_PROJECT_NAME', 'Process')
+Remove-Item Env:\COMPOSE_PROJECT_NAME -ErrorAction SilentlyContinue
 
 try {
     Copy-Item (Join-Path $repoRoot '.env.example') (Join-Path $tempRoot '.env.example')
@@ -51,7 +53,12 @@ try {
         "COMPOSE_PROJECT_NAME=ai-stack-tests-$([guid]::NewGuid().ToString('N'))"
     )
     [System.IO.File]::WriteAllText($examplePath, $example, (New-Object System.Text.UTF8Encoding($false)))
+    $testDataPath = Join-Path $tempRoot 'home\.ai-stack'
+    $testClientHome = Join-Path $tempRoot 'clients'
+    New-Item -ItemType Directory -Path (Split-Path $testDataPath -Parent) | Out-Null
     $env:AI_STACK_TEST_ROOT = $tempRoot
+    $env:AI_STACK_TEST_DATA_PATH = $testDataPath
+    $env:AI_STACK_TEST_CLIENT_HOME = $testClientHome
     Import-Module $modulePath -Force
 
     Invoke-Test 'PowerShell files parse cleanly' {
@@ -80,29 +87,57 @@ try {
         Assert-True ($compose -match '(?ms)^\s{2}agentmemory:.*?^\s{4}stop_grace_period:\s*30s') 'AgentMemory does not have enough time for state flush.'
     }
 
-    Invoke-Test 'LiteLLM persists all Copilot credential files' {
+    Invoke-Test 'Docker data persists under the local state directory' {
         $compose = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'compose.yaml'))
         Assert-True ($compose -match 'GITHUB_COPILOT_TOKEN_DIR:\s*/var/lib/litellm/github-copilot') 'LiteLLM does not write Copilot credentials to the mounted directory.'
-        Assert-True ($compose -match 'github-copilot-token:/var/lib/litellm/github-copilot') 'The Copilot credential directory is not a named volume.'
-        Assert-True ($compose -match '(?m)^\s{2}github-copilot-token:\s*$') 'The Copilot credential volume is not declared.'
+        Assert-True ($compose -match 'source:\s*\$\{AI_STACK_HOME:.*\}/data/github-copilot') 'Copilot credentials are not persisted under the home .ai-stack.'
+        Assert-True ($compose -match 'source:\s*\$\{AI_STACK_HOME:.*\}/data/agentmemory') 'AgentMemory data is not persisted under the home .ai-stack.'
+        Assert-True ($compose -notmatch '(?m)^volumes:\s*$') 'Compose still declares named volumes.'
     }
 
     Invoke-Test 'Setup is idempotent and generates local secrets' {
+        Copy-Item $examplePath (Join-Path $tempRoot '.env')
+        $legacyState = Join-Path $tempRoot '.state'
+        New-Item -ItemType Directory -Path $legacyState | Out-Null
+        'legacy launcher' | Set-Content -LiteralPath (Join-Path $legacyState 'agentmemory-mcp.ps1')
+        $copilotConfig = Join-Path $testClientHome '.copilot\mcp-config.json'
+        $codexConfig = Join-Path $testClientHome '.codex\config.toml'
+        New-Item -ItemType Directory -Path (Split-Path $copilotConfig -Parent) -Force | Out-Null
+        New-Item -ItemType Directory -Path (Split-Path $codexConfig -Parent) -Force | Out-Null
+        '{"mcpServers":{"agentmemory":{"command":"powershell.exe","args":["-File","C:\\old\\agentmemory-mcp.ps1"]}}}' |
+            Set-Content -LiteralPath $copilotConfig -Encoding UTF8
+        "[mcp_servers.agentmemory]`ncommand = `"powershell.exe`"`nargs = [`"-File`", `"C:\\old\\agentmemory-mcp.ps1`"]" |
+            Set-Content -LiteralPath $codexConfig -Encoding UTF8
+
         Initialize-AiStackConfiguration
-        $envBefore = [System.IO.File]::ReadAllText((Join-Path $tempRoot '.env'))
-        $secretBefore = [System.IO.File]::ReadAllText((Join-Path $tempRoot '.state\agentmemory-secret'))
+        $envBefore = [System.IO.File]::ReadAllText((Join-Path $testDataPath '.env'))
+        $secretBefore = [System.IO.File]::ReadAllText((Join-Path $testDataPath 'agentmemory-secret'))
         Initialize-AiStackConfiguration
-        $envAfter = [System.IO.File]::ReadAllText((Join-Path $tempRoot '.env'))
-        $secretAfter = [System.IO.File]::ReadAllText((Join-Path $tempRoot '.state\agentmemory-secret'))
+        $envAfter = [System.IO.File]::ReadAllText((Join-Path $testDataPath '.env'))
+        $secretAfter = [System.IO.File]::ReadAllText((Join-Path $testDataPath 'agentmemory-secret'))
 
         Assert-Equal $envBefore $envAfter 'Setup changed .env on the second run.'
         Assert-Equal $secretBefore $secretAfter 'Setup rotated the AgentMemory secret.'
         Assert-True ($envBefore -notmatch 'change-me-generated-by-setup') 'LiteLLM placeholder was not replaced.'
         Assert-True ($secretBefore -match '^am_[0-9a-f]{64}$') 'AgentMemory secret has the wrong format.'
+        Assert-True (-not (Test-Path (Join-Path $tempRoot '.env'))) 'Legacy .env was not removed.'
+        Assert-True (-not (Test-Path (Join-Path $tempRoot '.state'))) 'Legacy .state was not removed.'
+        Assert-True (Test-Path (Join-Path $testDataPath 'agentmemory-mcp.ps1')) 'MCP launcher was not consolidated.'
+        Assert-True (Test-Path (Join-Path $testDataPath 'data\agentmemory')) 'AgentMemory data directory was not created.'
+        Assert-True (Test-Path (Join-Path $testDataPath 'data\github-copilot')) 'Copilot data directory was not created.'
+        Assert-True ($envBefore -match '(?m)^AI_STACK_HOME=.+/home/\.ai-stack$') 'The Docker-compatible home path was not generated.'
+        $updatedCopilot = [System.IO.File]::ReadAllText($copilotConfig) | ConvertFrom-Json
+        Assert-Equal (Join-Path $testDataPath 'agentmemory-mcp.ps1') $updatedCopilot.mcpServers.agentmemory.args[-1] 'Copilot retained the legacy launcher path.'
+        Assert-True ([System.IO.File]::ReadAllText($codexConfig) -match [regex]::Escape($testDataPath.Replace('\', '\\'))) 'Codex retained the legacy launcher path.'
+        if ($env:OS -eq 'Windows_NT') {
+            Assert-True ((Get-Acl $testDataPath).AreAccessRulesProtected) '.ai-stack still inherits permissions from its parent.'
+            $allowed = @((Get-Acl $testDataPath).Access | ForEach-Object { $_.IdentityReference.Value })
+            Assert-Equal 3 $allowed.Count 'The home state ACL contains unexpected explicit principals.'
+        }
     }
 
     Invoke-Test 'Cloudflare config generation is safe and idempotent' {
-        $configPath = Join-Path $tempRoot '.state\cloudflared\config.yml'
+        $configPath = Join-Path $testDataPath 'cloudflared\config.yml'
         $tunnelId = '245b35f7-4ee8-4d7f-a39a-5ad80c128f51'
         Assert-True (New-CloudflareTunnelConfig `
             -TunnelId $tunnelId `
@@ -157,7 +192,8 @@ try {
         $compose = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'compose.yaml'))
         $envExample = [System.IO.File]::ReadAllText((Join-Path $repoRoot '.env.example'))
         $module = [System.IO.File]::ReadAllText($modulePath)
-        Assert-True ($compose -match '\.state/cloudflared:/etc/cloudflared:ro') 'Cloudflare state is not mounted read-only.'
+        Assert-True ($compose -match 'source:\s*\$\{AI_STACK_HOME:.*\}/cloudflared') 'Cloudflare home state is not mounted.'
+        Assert-True ($compose -match 'read_only:\s*true') 'Cloudflare state is not mounted read-only.'
         Assert-True ($compose -match '/etc/cloudflared/config\.yml') 'Cloudflare config file is not used.'
         Assert-True ($compose -notmatch 'CLOUDFLARE_TUNNEL_TOKEN') 'Compose still depends on a remotely managed tunnel token.'
         Assert-True ($envExample -notmatch 'CLOUDFLARE_TUNNEL_TOKEN') '.env.example still requests a tunnel token.'
@@ -170,7 +206,7 @@ try {
         New-Item -ItemType Directory -Path (Split-Path $copilotPath -Parent) | Out-Null
         '{"mcpServers":{"existing":{"command":"existing"}},"setting":true}' |
             Set-Content -LiteralPath $copilotPath -Encoding UTF8
-        $launcher = Join-Path $tempRoot '.state\agentmemory-mcp.ps1'
+        $launcher = Join-Path $testDataPath 'agentmemory-mcp.ps1'
 
         Assert-True (Merge-CopilotMcpConfig -Path $copilotPath -LauncherPath $launcher)
         $backupCount = @(Get-ChildItem "$copilotPath.ai-stack-backup-*").Count
@@ -195,7 +231,7 @@ command = "existing"
 [mcp_servers.agentmemory]
 command = "old"
 '@ | Set-Content -LiteralPath $codexPath -Encoding UTF8
-        $launcher = Join-Path $tempRoot '.state\agentmemory-mcp.ps1'
+        $launcher = Join-Path $testDataPath 'agentmemory-mcp.ps1'
 
         Assert-True (Merge-CodexMcpConfig -Path $codexPath -LauncherPath $launcher)
         $first = [System.IO.File]::ReadAllText($codexPath)
@@ -230,6 +266,11 @@ command = "old"
 finally {
     Remove-Module AiStack -ErrorAction SilentlyContinue
     Remove-Item Env:\AI_STACK_TEST_ROOT -ErrorAction SilentlyContinue
+    Remove-Item Env:\AI_STACK_TEST_DATA_PATH -ErrorAction SilentlyContinue
+    Remove-Item Env:\AI_STACK_TEST_CLIENT_HOME -ErrorAction SilentlyContinue
+    if ($null -ne $previousComposeProjectName) {
+        $env:COMPOSE_PROJECT_NAME = $previousComposeProjectName
+    }
     Remove-Item -LiteralPath $tempRoot -Recurse -Force
 }
 

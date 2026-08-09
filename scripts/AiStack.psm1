@@ -7,15 +7,33 @@ $script:Root = if ($env:AI_STACK_TEST_ROOT) {
 else {
     Split-Path $PSScriptRoot -Parent
 }
-$script:EnvPath = Join-Path $script:Root '.env'
+$script:DataPath = if ($env:AI_STACK_TEST_DATA_PATH) {
+    [System.IO.Path]::GetFullPath($env:AI_STACK_TEST_DATA_PATH)
+}
+else {
+    Join-Path ([Environment]::GetFolderPath('UserProfile')) '.ai-stack'
+}
+$script:EnvPath = Join-Path $script:DataPath '.env'
 $script:EnvExamplePath = Join-Path $script:Root '.env.example'
 $script:ComposePath = Join-Path $script:Root 'compose.yaml'
-$script:StatePath = Join-Path $script:Root '.state'
+$script:StatePath = $script:DataPath
 $script:McpLauncherPath = Join-Path $script:StatePath 'agentmemory-mcp.ps1'
 $script:AgentMemorySecretPath = Join-Path $script:StatePath 'agentmemory-secret'
 $script:CloudflareStatePath = Join-Path $script:StatePath 'cloudflared'
 $script:CloudflareConfigPath = Join-Path $script:CloudflareStatePath 'config.yml'
 $script:CloudflareCredentialsPath = Join-Path $script:CloudflareStatePath 'credentials.json'
+$script:AgentMemoryDataPath = Join-Path $script:DataPath 'data\agentmemory'
+$script:CopilotDataPath = Join-Path $script:DataPath 'data\github-copilot'
+$script:LegacyEnvPath = Join-Path $script:Root '.env'
+$script:LegacyStatePath = Join-Path $script:Root '.state'
+$script:LegacyRepoDataPath = Join-Path $script:Root '.ai-stack'
+$script:ClientHome = if ($env:AI_STACK_TEST_CLIENT_HOME) {
+    [System.IO.Path]::GetFullPath($env:AI_STACK_TEST_CLIENT_HOME)
+}
+else {
+    [Environment]::GetFolderPath('UserProfile')
+}
+$script:MigrationPerformed = $false
 
 function Write-Utf8NoBom {
     param(
@@ -76,12 +94,124 @@ function Set-DotEnvValue {
     return $Content.TrimEnd() + [Environment]::NewLine + "$Name=$Value" + [Environment]::NewLine
 }
 
+function Protect-AiStackData {
+    if ($env:OS -ne 'Windows_NT' -or
+        -not (Test-Path -LiteralPath $script:DataPath)) {
+        return
+    }
+    $icacls = Get-Command icacls.exe -ErrorAction SilentlyContinue
+    if (-not $icacls) {
+        throw 'Cannot secure .ai-stack because icacls.exe is unavailable.'
+    }
+    $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $allowedSids = @($currentSid, 'S-1-5-18', 'S-1-5-32-544')
+    & $icacls.Source $script:DataPath /inheritance:d /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Failed to disable inherited permissions on .ai-stack.'
+    }
+    $existingSids = @((Get-Acl -LiteralPath $script:DataPath).Access | ForEach-Object {
+        try {
+            $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value
+        }
+        catch {
+            throw "Cannot resolve ACL identity '$($_.IdentityReference)'."
+        }
+    } | Select-Object -Unique)
+    foreach ($sid in $existingSids | Where-Object { $_ -notin $allowedSids }) {
+        & $icacls.Source $script:DataPath /remove "*$sid" /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to remove unexpected ACL principal '$sid' from .ai-stack."
+        }
+    }
+    $grantArguments = @(
+        $script:DataPath,
+        '/grant:r',
+        "*${currentSid}:(OI)(CI)F",
+        '*S-1-5-18:(OI)(CI)F',
+        '*S-1-5-32-544:(OI)(CI)F',
+        '/Q'
+    )
+    & $icacls.Source @grantArguments | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw 'Failed to grant restricted permissions on .ai-stack.'
+    }
+    foreach ($item in Get-ChildItem -LiteralPath $script:DataPath -Recurse -Force) {
+        & $icacls.Source $item.FullName /reset /Q | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to inherit restricted permissions on '$($item.FullName)'."
+        }
+    }
+}
+
+function Move-LegacyAiStackState {
+    $legacyRepoDataExists = $script:LegacyRepoDataPath -ne $script:DataPath -and
+        (Test-Path -LiteralPath $script:LegacyRepoDataPath)
+    $legacyEnvExists = Test-Path -LiteralPath $script:LegacyEnvPath
+    $legacyStateExists = Test-Path -LiteralPath $script:LegacyStatePath
+    if (-not $legacyRepoDataExists -and -not $legacyEnvExists -and -not $legacyStateExists) {
+        return
+    }
+    if ($legacyRepoDataExists -and (Test-DirectoryHasData -Path $script:DataPath)) {
+        throw "Both repository-local state '$script:LegacyRepoDataPath' and home state '$script:DataPath' contain data. Reconcile them manually before continuing."
+    }
+    if ($legacyRepoDataExists -and $legacyEnvExists -and
+        (Test-Path -LiteralPath (Join-Path $script:LegacyRepoDataPath '.env'))) {
+        throw 'Both repository .env and repository-local .ai-stack\.env exist. Reconcile them manually before continuing.'
+    }
+    if ($legacyEnvExists -and (Test-Path -LiteralPath $script:EnvPath)) {
+        throw 'Both repository .env and home .ai-stack\.env exist. Reconcile them manually before continuing.'
+    }
+    if ($legacyStateExists) {
+        foreach ($name in @('agentmemory-secret', 'agentmemory-mcp.ps1', 'cloudflared')) {
+            $source = Join-Path $script:LegacyStatePath $name
+            $destination = Join-Path $script:DataPath $name
+            if ($legacyRepoDataExists) {
+                $destination = Join-Path $script:LegacyRepoDataPath $name
+            }
+            if ((Test-Path -LiteralPath $source) -and (Test-Path -LiteralPath $destination)) {
+                throw "Both legacy and current ai-stack state exist for '$name'. Reconcile them manually before continuing."
+            }
+        }
+    }
+    if ($legacyRepoDataExists) {
+        if (Test-Path -LiteralPath $script:DataPath) {
+            Remove-Item -LiteralPath $script:DataPath -Force
+        }
+        Move-Item -LiteralPath $script:LegacyRepoDataPath -Destination $script:DataPath
+    }
+    elseif (-not (Test-Path -LiteralPath $script:DataPath)) {
+        New-Item -ItemType Directory -Path $script:DataPath -Force | Out-Null
+    }
+    if ($legacyEnvExists) {
+        Move-Item -LiteralPath $script:LegacyEnvPath -Destination $script:EnvPath
+    }
+    if ($legacyStateExists) {
+        foreach ($name in @('agentmemory-secret', 'agentmemory-mcp.ps1', 'cloudflared')) {
+            $source = Join-Path $script:LegacyStatePath $name
+            if (-not (Test-Path -LiteralPath $source)) {
+                continue
+            }
+            $destination = Join-Path $script:DataPath $name
+            Move-Item -LiteralPath $source -Destination $destination
+        }
+        if (@(Get-ChildItem -LiteralPath $script:LegacyStatePath -Force).Count -eq 0) {
+            Remove-Item -LiteralPath $script:LegacyStatePath -Force
+        }
+        else {
+            Write-Warning "Unrecognized files remain in '$script:LegacyStatePath'; they were not moved or deleted."
+        }
+    }
+    Protect-AiStackData
+    $script:MigrationPerformed = $true
+    Write-Host "Migrated generated runtime state to '$script:DataPath'."
+}
+
 function New-McpLauncher {
     if (-not (Test-Path -LiteralPath $script:StatePath)) {
         New-Item -ItemType Directory -Path $script:StatePath | Out-Null
     }
 
-    $relativeEnvPath = '..\.env'
+    $relativeEnvPath = '.env'
     $content = @"
 `$ErrorActionPreference = 'Stop'
 `$envPath = [System.IO.Path]::GetFullPath((Join-Path `$PSScriptRoot '$relativeEnvPath'))
@@ -102,31 +232,165 @@ exit `$LASTEXITCODE
     Write-Utf8NoBom -Path $script:McpLauncherPath -Content $content
 }
 
-function Test-AiStackDataVolumeExists {
-    param([Parameter(Mandatory = $true)][string]$ProjectName)
+function Update-MigratedClientLaunchers {
+    if (-not $script:MigrationPerformed) {
+        return
+    }
 
+    $copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $script:ClientHome '.copilot' }
+    $copilotConfig = Join-Path $copilotHome 'mcp-config.json'
+    if (Test-Path -LiteralPath $copilotConfig) {
+        try {
+            $config = [System.IO.File]::ReadAllText($copilotConfig) | ConvertFrom-Json
+        }
+        catch {
+            throw "Cannot inspect malformed Copilot MCP JSON at '$copilotConfig': $($_.Exception.Message)"
+        }
+        if ($config.PSObject.Properties['mcpServers'] -and
+            $config.mcpServers.PSObject.Properties['agentmemory']) {
+            [void](Merge-CopilotMcpConfig -Path $copilotConfig -LauncherPath $script:McpLauncherPath)
+        }
+    }
+
+    $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $script:ClientHome '.codex' }
+    $codexConfig = Join-Path $codexHome 'config.toml'
+    if ((Test-Path -LiteralPath $codexConfig) -and
+        ([System.IO.File]::ReadAllText($codexConfig) -match '(?m)^\[mcp_servers\.agentmemory\]')) {
+        [void](Merge-CodexMcpConfig -Path $codexConfig -LauncherPath $script:McpLauncherPath)
+    }
+}
+
+function Test-DirectoryHasData {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    return (Test-Path -LiteralPath $Path) -and
+        (@(Get-ChildItem -LiteralPath $Path -Force).Count -gt 0)
+}
+
+function Test-DockerAvailable {
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
         return $false
     }
     $previousErrorAction = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'SilentlyContinue'
-        & docker volume inspect "$ProjectName`_agentmemory-data" *> $null
-        $exists = $LASTEXITCODE -eq 0
+        & docker info --format '{{.ServerVersion}}' *> $null
+        return $LASTEXITCODE -eq 0
     }
     finally {
         $ErrorActionPreference = $previousErrorAction
+        $global:LASTEXITCODE = 0
     }
-    # An expected "volume not found" must not become the caller's process exit
-    # code when setup is run directly from CI or a shell.
-    $global:LASTEXITCODE = 0
-    return $exists
+}
+
+function Test-DockerVolumeExists {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $previousErrorAction = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'SilentlyContinue'
+        & docker volume inspect $Name *> $null
+        return $LASTEXITCODE -eq 0
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorAction
+        $global:LASTEXITCODE = 0
+    }
+}
+
+function Get-AiStackProjectName {
+    if (-not [string]::IsNullOrWhiteSpace($env:COMPOSE_PROJECT_NAME)) {
+        return $env:COMPOSE_PROJECT_NAME.Trim()
+    }
+    $values = Get-DotEnvValues -Path $script:EnvPath
+    if ($values.ContainsKey('COMPOSE_PROJECT_NAME') -and
+        -not [string]::IsNullOrWhiteSpace($values['COMPOSE_PROJECT_NAME'])) {
+        return $values['COMPOSE_PROJECT_NAME'].Trim().Trim('"').Trim("'")
+    }
+    return 'ai-stack'
+}
+
+function Move-LegacyDockerData {
+    param([Parameter(Mandatory = $true)][string]$ProjectName)
+
+    foreach ($path in @($script:AgentMemoryDataPath, $script:CopilotDataPath)) {
+        if (-not (Test-Path -LiteralPath $path)) {
+            New-Item -ItemType Directory -Path $path | Out-Null
+        }
+    }
+    if (-not (Test-DockerAvailable)) {
+        return
+    }
+
+    $migrations = @(
+        @{ Volume = "$ProjectName`_agentmemory-data"; Destination = $script:AgentMemoryDataPath },
+        @{ Volume = "$ProjectName`_github-copilot-token"; Destination = $script:CopilotDataPath }
+    )
+    $pendingMigrations = @($migrations | Where-Object {
+        Test-DockerVolumeExists -Name $_.Volume
+    })
+    foreach ($migration in $pendingMigrations) {
+        if (Test-DirectoryHasData -Path $migration.Destination) {
+            throw "Both legacy Docker volume '$($migration.Volume)' and '$($migration.Destination)' contain data. Reconcile them manually before continuing."
+        }
+
+        $previousErrorAction = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'SilentlyContinue'
+            $runningContainers = @(& docker ps --filter "volume=$($migration.Volume)" --format '{{.ID}}' 2>$null)
+        }
+        finally {
+            $ErrorActionPreference = $previousErrorAction
+            $global:LASTEXITCODE = 0
+        }
+        if ($runningContainers.Count -gt 0) {
+            throw "Docker volume '$($migration.Volume)' is in use. Run '.\ai-stack.ps1 stop', then rerun setup to migrate it safely."
+        }
+    }
+
+    foreach ($migration in $pendingMigrations) {
+        Write-Host "Migrating Docker volume '$($migration.Volume)' to '$($migration.Destination)'..."
+        & docker run --rm `
+            --mount "type=volume,source=$($migration.Volume),target=/source,readonly" `
+            --mount "type=bind,source=$($migration.Destination),target=/destination" `
+            alpine:3.22 sh -c 'cp -a /source/. /destination/'
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to migrate Docker volume '$($migration.Volume)'. The source volume was preserved."
+        }
+        & docker volume rm $migration.Volume
+        if ($LASTEXITCODE -ne 0) {
+            throw "Data was copied, but legacy Docker volume '$($migration.Volume)' could not be removed."
+        }
+    }
+}
+
+function Remove-LegacyDockerData {
+    param([Parameter(Mandatory = $true)][string]$ProjectName)
+
+    if (-not (Test-DockerAvailable)) {
+        return
+    }
+    foreach ($volume in @(
+        "$ProjectName`_agentmemory-data",
+        "$ProjectName`_github-copilot-token"
+    )) {
+        if (Test-DockerVolumeExists -Name $volume) {
+            & docker volume rm $volume
+            if ($LASTEXITCODE -ne 0) {
+                throw "Failed to remove legacy Docker volume '$volume'."
+            }
+        }
+    }
 }
 
 function Initialize-AiStackConfiguration {
     [CmdletBinding()]
     param([switch]$PassThru)
 
+    Move-LegacyAiStackState
+    if (-not (Test-Path -LiteralPath $script:DataPath)) {
+        New-Item -ItemType Directory -Path $script:DataPath -Force | Out-Null
+    }
     if (-not (Test-Path -LiteralPath $script:EnvPath)) {
         Copy-Item -LiteralPath $script:EnvExamplePath -Destination $script:EnvPath
     }
@@ -139,25 +403,24 @@ function Initialize-AiStackConfiguration {
         $values['LITELLM_MASTER_KEY'] -eq 'change-me-generated-by-setup') {
         $content = Set-DotEnvValue -Content $content -Name 'LITELLM_MASTER_KEY' -Value (New-AiStackSecret -Prefix 'sk-local-')
     }
+    $content = Set-DotEnvValue -Content $content -Name 'AI_STACK_HOME' -Value $script:DataPath.Replace('\', '/')
     Write-Utf8NoBom -Path $script:EnvPath -Content $content
+    $projectName = Get-AiStackProjectName
+    Move-LegacyDockerData -ProjectName $projectName
     if (-not (Test-Path -LiteralPath $script:StatePath)) {
         New-Item -ItemType Directory -Path $script:StatePath | Out-Null
     }
     if (-not (Test-Path -LiteralPath $script:AgentMemorySecretPath) -or
         [string]::IsNullOrWhiteSpace([System.IO.File]::ReadAllText($script:AgentMemorySecretPath))) {
-        $projectName = if ($values.ContainsKey('COMPOSE_PROJECT_NAME')) {
-            $values['COMPOSE_PROJECT_NAME']
-        }
-        else {
-            'ai-stack'
-        }
-        if (Test-AiStackDataVolumeExists -ProjectName $projectName) {
-            throw 'AgentMemory data exists but .state\agentmemory-secret is missing. Restore the matching secret backup or intentionally delete the data volume before running setup.'
+        if (Test-DirectoryHasData -Path $script:AgentMemoryDataPath) {
+            throw 'AgentMemory data exists but ~\.ai-stack\agentmemory-secret is missing. Restore the matching secret backup or intentionally delete ~\.ai-stack\data\agentmemory before running setup.'
         }
         Write-Utf8NoBom -Path $script:AgentMemorySecretPath -Content (New-AiStackSecret -Prefix 'am_')
     }
     New-McpLauncher
-    Write-Host 'Local configuration initialized. Secrets remain in git-ignored local files.'
+    Update-MigratedClientLaunchers
+    Protect-AiStackData
+    Write-Host "Local configuration initialized in '$script:DataPath'."
     if ($PassThru) {
         return $script:EnvPath
     }
@@ -166,6 +429,7 @@ function Initialize-AiStackConfiguration {
 function Get-ComposeArguments {
     $arguments = @(
         'compose',
+        '--project-name', (Get-AiStackProjectName),
         '--project-directory', $script:Root,
         '--env-file', $script:EnvPath,
         '-f', $script:ComposePath
@@ -180,17 +444,29 @@ function Invoke-DockerCompose {
     )
 
     $allArguments = @(Get-ComposeArguments) + $Arguments
-    if ($Capture) {
-        $output = & docker @allArguments 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "docker compose failed: $($output -join [Environment]::NewLine)"
+    $previousHome = [Environment]::GetEnvironmentVariable('AI_STACK_HOME', 'Process')
+    $env:AI_STACK_HOME = $script:DataPath.Replace('\', '/')
+    try {
+        if ($Capture) {
+            $output = & docker @allArguments 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "docker compose failed: $($output -join [Environment]::NewLine)"
+            }
+            return $output
         }
-        return $output
-    }
 
-    & docker @allArguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "docker compose exited with code $LASTEXITCODE."
+        & docker @allArguments
+        if ($LASTEXITCODE -ne 0) {
+            throw "docker compose exited with code $LASTEXITCODE."
+        }
+    }
+    finally {
+        if ($null -eq $previousHome) {
+            Remove-Item Env:\AI_STACK_HOME -ErrorAction SilentlyContinue
+        }
+        else {
+            $env:AI_STACK_HOME = $previousHome
+        }
     }
 }
 
@@ -346,7 +622,7 @@ function Initialize-CloudflareTunnel {
     foreach ($name in @('CLOUDFLARE_REST_HOSTNAME', 'CLOUDFLARE_VIEWER_HOSTNAME')) {
         if (-not $values.ContainsKey($name) -or [string]::IsNullOrWhiteSpace($values[$name]) -or
             $values[$name] -like '*.example.com') {
-            throw "$name must be set to a real hostname in .env."
+            throw "$name must be set to a real hostname in ~\.ai-stack\.env."
         }
     }
 
@@ -380,7 +656,7 @@ function Initialize-CloudflareTunnel {
         }
         $matchingTunnels = @(Find-CloudflareTunnelsByName -Tunnels $tunnels -Name $tunnelName)
         if ($matchingTunnels.Count -gt 0) {
-            throw "Tunnel '$tunnelName' already exists but its local credentials are missing. Restore .state\cloudflared\credentials.json or choose a different CLOUDFLARE_TUNNEL_NAME."
+            throw "Tunnel '$tunnelName' already exists but its local credentials are missing. Restore ~\.ai-stack\cloudflared\credentials.json or choose a different CLOUDFLARE_TUNNEL_NAME."
         }
 
         [void](Invoke-CloudflaredCommand -Command $cloudflared -Arguments @(
@@ -421,6 +697,7 @@ function Assert-TunnelConfigured {
 }
 
 function Assert-AiStackEnvExists {
+    Move-LegacyAiStackState
     if (-not (Test-Path -LiteralPath $script:EnvPath)) {
         throw "Local configuration is missing at '$script:EnvPath'. Run setup first."
     }
@@ -604,7 +881,7 @@ function Install-AiStackClients {
     param([ValidateSet('All', 'Copilot', 'Codex')][string]$Client = 'All')
 
     Initialize-AiStackConfiguration
-    $homePath = [Environment]::GetFolderPath('UserProfile')
+    $homePath = $script:ClientHome
 
     if ($Client -in @('All', 'Copilot')) {
         $copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $homePath '.copilot' }
@@ -736,18 +1013,30 @@ function Uninstall-AiStack {
     )
 
     Assert-AiStackEnvExists
+    $projectName = Get-AiStackProjectName
     $arguments = @('--profile', 'tunnel', 'down', '--remove-orphans')
     if ($DeleteData) {
         if (-not $Force) {
             $answer = Read-Host 'This permanently deletes AgentMemory data and Copilot OAuth state. Type DELETE to continue'
             if ($answer -cne 'DELETE') {
-                throw 'Volume deletion cancelled.'
+                throw 'Data deletion cancelled.'
             }
         }
-        $arguments += '--volumes'
     }
     Invoke-DockerCompose -Arguments $arguments
-    Write-Host 'Containers and networks removed. Existing client configuration and local .env were preserved.'
+    if ($DeleteData) {
+        foreach ($path in @($script:AgentMemoryDataPath, $script:CopilotDataPath)) {
+            if (Test-Path -LiteralPath $path) {
+                Remove-Item -LiteralPath $path -Recurse -Force
+            }
+        }
+        Remove-LegacyDockerData -ProjectName $projectName
+        Write-Host 'Containers, network, AgentMemory data, and Copilot OAuth state removed. Home configuration and local secrets were preserved.'
+    }
+    else {
+        Move-LegacyDockerData -ProjectName $projectName
+        Write-Host 'Containers and network removed. Existing client configuration and home .ai-stack runtime state were preserved.'
+    }
 }
 
 Export-ModuleMember -Function @(

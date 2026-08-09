@@ -29,7 +29,7 @@ cd ai-stack
 
 The first Copilot model request starts GitHub's device flow. Follow the
 verification URL and code in the LiteLLM logs. The OAuth credential persists
-in a named Docker volume.
+under `%USERPROFILE%\.ai-stack\data\github-copilot`.
 
 Install memory integration after the stack is healthy:
 
@@ -52,8 +52,8 @@ flowchart LR
   LL["LiteLLM 1.95.0"] --> Copilot["GitHub Copilot"]
   LL -. "optional embedding route" .-> OpenAI["OpenAI"]
   CF["Cloudflare Tunnel<br/>(opt-in)"] -.-> AM
-  V1[("agentmemory-data")] --- AM
-  V2[("github-copilot-token")] --- LL
+  V1[("~/.ai-stack/data/agentmemory")] --- AM
+  V2[("~/.ai-stack/data/github-copilot")] --- LL
 ```
 
 All containers share the project-only `ai-stack` bridge network. Container DNS
@@ -68,15 +68,17 @@ AgentMemory image build, and an enabled tunnel.
 | AgentMemory viewer | `127.0.0.1:3113` | `agentmemory:3113` | Local memory viewer |
 | iii stream | none | `agentmemory:3112` | Internal AgentMemory worker transport |
 
-Host ports are configurable in `.env`; every published port remains bound to
-`127.0.0.1`. LiteLLM is never part of the tunnel profile.
+Host ports are configurable in `~\.ai-stack\.env`; every published port remains
+bound to `127.0.0.1`. LiteLLM is never part of the tunnel profile. All generated
+configuration, credentials, and container data are consolidated under the
+ACL-restricted `%USERPROFILE%\.ai-stack` directory, independent of the clone.
 
 ## Management commands
 
 | Command | Behavior |
 | --- | --- |
-| `setup` | Creates `.env`, generates local secrets, and writes the MCP launcher |
-| `configure` | Runs setup and opens the git-ignored `.env` in Notepad |
+| `setup` | Creates `~\.ai-stack`, generates local secrets, and writes the MCP launcher |
+| `configure` | Runs setup and opens `~\.ai-stack\.env` in Notepad |
 | `configure-tunnel` | Creates a locally managed tunnel, DNS routes, credentials, and config file |
 | `start [-Tunnel]` | Builds and starts the stack, optionally including Cloudflare |
 | `stop` | Stops containers without deleting credentials or memories |
@@ -85,11 +87,17 @@ Host ports are configurable in `.env`; every published port remains bound to
 | `doctor` | Checks Docker, local config, Node, and health endpoints |
 | `logs [-Service ...]` | Follows redacted-by-design service logs |
 | `install-clients` | Merges MCP config and installs official upstream plugins |
-| `uninstall` | Removes containers/network but preserves config and volumes |
-| `uninstall -DeleteData` | Deletes both named volumes after typing `DELETE` |
+| `uninstall` | Removes containers/network but preserves `~\.ai-stack` |
+| `uninstall -DeleteData` | Deletes AgentMemory and Copilot data after typing `DELETE` |
 
-`-Force` allows non-interactive volume deletion and should be used only in
+`-Force` allows non-interactive data deletion and should be used only in
 automation that intentionally discards all memories and Copilot login state.
+
+Upgrades from older ai-stack releases are automatic. Stop the old stack, then
+run `setup`; the command moves root `.env`/`.state` files and copies the two
+legacy Docker volumes into the home directory before removing those migrated
+volumes. Repository-local `.ai-stack` state from preview versions is also moved.
+Setup refuses to overwrite conflicting data.
 
 ## Models and embeddings
 
@@ -99,7 +107,7 @@ bridge OpenAI Chat Completions callers correctly.
 
 AgentMemory calls LiteLLM at the internal URL `http://litellm:4000/v1`.
 Its default chat model is `gpt-5.6-sol`. Change
-`AGENTMEMORY_LLM_MODEL` in `.env` to another listed alias.
+`AGENTMEMORY_LLM_MODEL` in `~\.ai-stack\.env` to another listed alias.
 
 Embeddings default to AgentMemory's bundled local provider, so semantic search
 works without an external key. To use OpenAI
@@ -124,7 +132,12 @@ npx -y @agentmemory/mcp@0.9.28
 
 It sets `AGENTMEMORY_URL=http://localhost:3111`,
 `AGENTMEMORY_TOOLS=all`, and loads the bearer secret from
-`.state/agentmemory-secret`. No bearer value is written to a client config.
+`~\.ai-stack\agentmemory-secret`. No bearer value is written to a client config.
+To copy the bearer without displaying it, run this from any directory:
+
+```powershell
+(Get-Content (Join-Path $HOME '.ai-stack\agentmemory-secret') -Raw).Trim() | Set-Clipboard
+```
 
 The installer creates timestamped backups before changing an existing file and
 preserves all unrelated entries:
@@ -153,13 +166,13 @@ Streamable HTTP MCP server.
 This stack uses a **locally managed** named tunnel. The route definition is a
 generated config file, not dashboard state:
 
-| `.env` hostname | Config-file service |
+| `~\.ai-stack\.env` hostname | Config-file service |
 | --- | --- |
 | `CLOUDFLARE_REST_HOSTNAME` | `http://agentmemory:3111` |
 | `CLOUDFLARE_VIEWER_HOSTNAME` | `http://agentmemory:3113` |
 
 Install `cloudflared`, set `CLOUDFLARE_TUNNEL_NAME` and both hostnames in
-`.env`, then run:
+`~\.ai-stack\.env`, then run:
 
 ```powershell
 .\ai-stack.ps1 configure-tunnel
@@ -171,10 +184,10 @@ login to create the named tunnel, generate tunnel-specific credentials, and
 create both DNS records; there is no API-token creation or secret copy/paste.
 Later runs reuse the local authorization and tunnel credentials. The command
 writes
-`.state\cloudflared\config.yml`, validates its ingress rules, and idempotently
+`~\.ai-stack\cloudflared\config.yml`, validates its ingress rules, and idempotently
 creates both DNS routes. Tunnel credentials remain in the git-ignored
-`.state\cloudflared\credentials.json`. Docker mounts this directory read-only,
-and `restart: unless-stopped` provides autostart with Docker Desktop.
+`~\.ai-stack\cloudflared\credentials.json`. Docker mounts this directory
+read-only, and `restart: unless-stopped` provides autostart with Docker Desktop.
 
 The profile is opt-in and does not publish LiteLLM. Apply Cloudflare Access to
 the viewer hostname so the HTML surface is identity-gated. Access policies are
@@ -200,26 +213,35 @@ ChatGPT connector.
 
 ## Security boundaries
 
-- `.env`, `.state/`, generated launchers, bearer secrets, tunnel credentials,
-  and backups are git-ignored.
+- Repository `.ai-stack/`, legacy `.env`/`.state/`, and backups are git-ignored.
+  Home state is outside the repository and protected separately.
+- On Windows, setup removes inherited ACLs from `~\.ai-stack` and grants access
+  only to the current user, SYSTEM, and local Administrators.
 - The AgentMemory bearer is mounted as a Docker secret and copied to
   `/data/.hmac`; it is not present in Compose environment metadata or logs.
 - Container shutdown forwards termination to AgentMemory and its detached iii
   engine, with a 30-second grace period for buffered state to reach `/data`.
-- Copilot OAuth state lives only in the `github-copilot-token` named volume.
-- AgentMemory memories and indexes live only in the `agentmemory-data` volume.
+- Copilot OAuth state lives in `~\.ai-stack\data\github-copilot`.
+- AgentMemory memories and indexes live in `~\.ai-stack\data\agentmemory`.
 - All host ports use explicit loopback bindings.
 - The viewer rejects unexpected Host headers and requires bearer auth for API
   calls because it binds to the private container network for tunnel support.
-- Anyone with Docker daemon or volume access can read local secrets and memory
+- Anyone with local filesystem or Docker daemon access can read secrets and memory
   data. This stack does not defend against a compromised local administrator.
 
-`.state/agentmemory-secret` is required state, not a disposable cache. The
-container refuses to start if it does not match the persisted `/data/.hmac`,
-preventing accidental credential rotation against an existing memory volume.
+Secrets and memories are not application-encrypted at rest. Use BitLocker on
+the home-directory drive. Gitignore and ACLs reduce accidental disclosure but are
+not substitutes for full-disk encryption. The viewer HTML is publicly reachable
+when the tunnel is enabled; API data still requires the AgentMemory bearer.
+Put Cloudflare Access in front of the viewer hostname before treating it as a
+private deployment.
 
-Do not paste `.env`, `.state/agentmemory-secret`, Docker volume contents, or
-unredacted authentication logs into issues.
+`~\.ai-stack\agentmemory-secret` is required state, not a disposable cache. The
+container refuses to start if it does not match the persisted `/data/.hmac`,
+preventing accidental credential rotation against existing memory data.
+
+Do not paste `~\.ai-stack\.env`, `~\.ai-stack\agentmemory-secret`, data-directory
+contents, or unredacted authentication logs into issues.
 
 ## Backup and restore
 
@@ -227,32 +249,31 @@ Stop writes before taking a consistent backup:
 
 ```powershell
 .\ai-stack.ps1 stop
+.\ai-stack.ps1 setup
 New-Item -ItemType Directory -Force backups | Out-Null
-docker run --rm -v ai-stack_agentmemory-data:/data -v "${PWD}\backups:/backup" alpine:3.22 tar czf /backup/agentmemory.tgz -C /data .
-docker run --rm -v ai-stack_github-copilot-token:/data -v "${PWD}\backups:/backup" alpine:3.22 tar czf /backup/copilot-token.tgz -C /data .
-Copy-Item .env backups\ai-stack.env
-Copy-Item .state\agentmemory-secret backups\agentmemory-secret
-if (Test-Path .state\cloudflared) { Copy-Item .state\cloudflared backups\cloudflared -Recurse }
+Compress-Archive -Path (Join-Path $HOME '.ai-stack') -DestinationPath backups\ai-stack.zip -Force
 ```
 
-Restore into stopped, empty volumes:
+Restore while the stack is stopped:
 
 ```powershell
-.\ai-stack.ps1 uninstall -DeleteData
-docker volume create ai-stack_agentmemory-data
-docker volume create ai-stack_github-copilot-token
-docker run --rm -v ai-stack_agentmemory-data:/data -v "${PWD}\backups:/backup" alpine:3.22 tar xzf /backup/agentmemory.tgz -C /data
-docker run --rm -v ai-stack_github-copilot-token:/data -v "${PWD}\backups:/backup" alpine:3.22 tar xzf /backup/copilot-token.tgz -C /data
-Copy-Item backups\ai-stack.env .env
-New-Item -ItemType Directory -Force .state | Out-Null
-Copy-Item backups\agentmemory-secret .state\agentmemory-secret
-if (Test-Path backups\cloudflared) { Copy-Item backups\cloudflared .state\cloudflared -Recurse }
+.\ai-stack.ps1 stop
+$stackHome = Join-Path $HOME '.ai-stack'
+$saved = Join-Path $HOME ".ai-stack.before-restore-$(Get-Date -Format yyyyMMdd-HHmmss)"
+Move-Item $stackHome $saved
+Expand-Archive backups\ai-stack.zip -DestinationPath $HOME
 .\ai-stack.ps1 start
 ```
 
-Backups contain credentials and private memories. Encrypt and protect them.
+Keep `$saved` until the restored stack passes `doctor`; it is the rollback copy.
+`Compress-Archive` does not encrypt the ZIP. Backups contain credentials and
+private memories, so encrypt the archive before copying it outside this machine.
 Tunnel credentials cannot be downloaded again; restoring their directory is
 required to reconnect the same locally managed tunnel.
+
+Do not put the live `~\.ai-stack` directory in OneDrive. AgentMemory
+uses SQLite and file-backed streams; concurrent sync can cause lock conflicts or
+corruption. A stopped, encrypted backup archive is appropriate for OneDrive.
 
 ## Updates
 
@@ -263,7 +284,7 @@ Dockerfile. Update one component at a time:
    AgentMemory/iii compatibility.
 2. Change the exact version. Keep AgentMemory and `@agentmemory/mcp` aligned.
 3. Run `.\tests\Run-Tests.ps1` and render Compose.
-4. Back up volumes, rebuild with `start`, then run `doctor`.
+4. Back up `~\.ai-stack`, rebuild with `start`, then run `doctor`.
 
 AgentMemory 0.9.28 requires iii 0.11.2; do not independently bump iii.
 
@@ -271,10 +292,10 @@ AgentMemory 0.9.28 requires iii 0.11.2; do not independently bump iii.
 
 **LiteLLM stays unauthenticated:** follow `logs -Service litellm`, make one
 model request, and complete GitHub's device flow. Deleting the Copilot token
-volume forces a new login.
+directory under `~\.ai-stack\data` forces a new login.
 
 **AgentMemory is unhealthy:** check `logs -Service agentmemory`, then confirm
-`.state/agentmemory-secret` exists without printing it. AgentMemory starts
+`~\.ai-stack\agentmemory-secret` exists without printing it. AgentMemory starts
 independently while LiteLLM waits for first-time Copilot device authorization.
 
 **MCP silently exposes only a few tools:** the official shim falls back to a
@@ -282,15 +303,15 @@ small local mode if `http://localhost:3111/agentmemory/livez` is unreachable.
 Run `doctor`; with the stack reachable, `AGENTMEMORY_TOOLS=all` exposes the full
 REST-backed tool set.
 
-**Custom ports do not work:** rerun `setup` after editing `.env` so the local
+**Custom ports do not work:** rerun `setup` after editing `~\.ai-stack\.env` so the local
 MCP launcher remains present, restart the stack, then restart clients.
 
 **Viewer returns a host or auth error:** ensure the local/public hostname
-matches `.env`, restart AgentMemory, and enter the bearer from the local
-`.state/agentmemory-secret` only in the trusted viewer prompt.
+matches `~\.ai-stack\.env`, restart AgentMemory, and enter the bearer from the
+local `~\.ai-stack\agentmemory-secret` only in the trusted viewer prompt.
 
 **Tunnel profile reports a missing config:** run `configure-tunnel`. If the
-named tunnel already exists but `.state\cloudflared\credentials.json` is
+named tunnel already exists but `~\.ai-stack\cloudflared\credentials.json` is
 missing, restore that credential from backup or choose a new tunnel name;
 Cloudflare does not allow downloading a locally managed tunnel secret again.
 
@@ -305,7 +326,7 @@ Run the dependency-free PowerShell test suite:
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Run-Tests.ps1
 .\ai-stack.ps1 setup
-docker compose --env-file .env -f compose.yaml config --quiet
+docker compose --env-file "$HOME/.ai-stack/.env" -f compose.yaml config --quiet
 ```
 
 The AgentMemory image follows the upstream Coolify all-in-one pattern from
