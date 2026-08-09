@@ -71,6 +71,15 @@ try {
         Assert-True ($dockerfile -match '@agentmemory/agentmemory@\$\{AGENTMEMORY_VERSION\}') 'AgentMemory is not version-pinned at build time.'
     }
 
+    Invoke-Test 'AgentMemory shutdown preserves buffered state' {
+        $entrypoint = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'docker\agentmemory\entrypoint.sh'))
+        $compose = [System.IO.File]::ReadAllText((Join-Path $repoRoot 'compose.yaml'))
+        Assert-True ($entrypoint -match 'AGENTMEMORY_DATA_DIR') 'The persistent AgentMemory data directory is not explicit.'
+        Assert-True ($entrypoint -match 'trap shutdown TERM INT') 'The entrypoint does not handle Docker shutdown signals.'
+        Assert-True ($entrypoint -match 'iii\.pid') 'The detached iii engine is not included in graceful shutdown.'
+        Assert-True ($compose -match '(?ms)^\s{2}agentmemory:.*?^\s{4}stop_grace_period:\s*30s') 'AgentMemory does not have enough time for state flush.'
+    }
+
     Invoke-Test 'Setup is idempotent and generates local secrets' {
         Initialize-AiStackConfiguration
         $envBefore = [System.IO.File]::ReadAllText((Join-Path $tempRoot '.env'))

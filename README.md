@@ -179,6 +179,8 @@ ChatGPT connector.
   git-ignored.
 - The AgentMemory bearer is mounted as a Docker secret and copied to
   `/data/.hmac`; it is not present in Compose environment metadata or logs.
+- Container shutdown forwards termination to AgentMemory and its detached iii
+  engine, with a 30-second grace period for buffered state to reach `/data`.
 - Copilot OAuth state lives only in the `github-copilot-token` named volume.
 - AgentMemory memories and indexes live only in the `agentmemory-data` volume.
 - All host ports use explicit loopback bindings.

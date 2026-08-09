@@ -40,6 +40,7 @@ services:
         III_VERSION: "0.11.2"
         III_SDK_VERSION: "0.11.2"
     restart: unless-stopped
+    stop_grace_period: 30s
     ports:
       - "127.0.0.1:${AGENTMEMORY_REST_PORT:-3111}:3111"
       - "127.0.0.1:${AGENTMEMORY_VIEWER_PORT:-3113}:3113"

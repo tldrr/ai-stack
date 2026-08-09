@@ -7,8 +7,11 @@ set -eu
 DATA_DIR="${AGENTMEMORY_DATA_DIR:-/data}"
 HMAC_FILE="${AGENTMEMORY_HMAC_FILE:-/data/.hmac}"
 SECRET_FILE="${AGENTMEMORY_SECRET_FILE:-/run/secrets/agentmemory-secret}"
+III_PID_FILE="/home/node/.agentmemory/iii.pid"
 RUN_AS="node:node"
 III_CONFIG="/opt/agentmemory/node_modules/@agentmemory/agentmemory/dist/iii-config.yaml"
+
+export AGENTMEMORY_DATA_DIR="$DATA_DIR"
 
 mkdir -p "$DATA_DIR"
 chown -R "$RUN_AS" "$DATA_DIR"
@@ -90,4 +93,57 @@ fi
 AGENTMEMORY_SECRET="$(cat "$HMAC_FILE")"
 export AGENTMEMORY_SECRET
 
-exec gosu "$RUN_AS" agentmemory "$@"
+CHILD_PID=""
+SHUTTING_DOWN=0
+
+shutdown() {
+  SHUTTING_DOWN=1
+  trap - TERM INT
+  echo "agentmemory: graceful shutdown requested" >&2
+
+  if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+    kill -TERM "$CHILD_PID" 2>/dev/null || true
+  fi
+
+  III_PID=""
+  if [ -s "$III_PID_FILE" ]; then
+    III_PID="$(cat "$III_PID_FILE" 2>/dev/null || true)"
+  fi
+  case "$III_PID" in
+    *[!0-9]*|"") III_PID="" ;;
+  esac
+  if [ -n "$III_PID" ] && kill -0 "$III_PID" 2>/dev/null; then
+    kill -TERM "$III_PID" 2>/dev/null || true
+  fi
+
+  attempts=0
+  while [ "$attempts" -lt 100 ]; do
+    child_running=0
+    engine_running=0
+    if [ -n "$CHILD_PID" ] && kill -0 "$CHILD_PID" 2>/dev/null; then
+      child_running=1
+    fi
+    if [ -n "$III_PID" ] && kill -0 "$III_PID" 2>/dev/null; then
+      engine_running=1
+    fi
+    if [ "$child_running" -eq 0 ] && [ "$engine_running" -eq 0 ]; then
+      break
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.2
+  done
+}
+
+trap shutdown TERM INT
+gosu "$RUN_AS" agentmemory "$@" &
+CHILD_PID=$!
+
+set +e
+wait "$CHILD_PID"
+STATUS=$?
+set -e
+
+if [ "$SHUTTING_DOWN" -eq 1 ]; then
+  exit 0
+fi
+exit "$STATUS"
