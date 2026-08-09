@@ -20,6 +20,8 @@ param(
     [string]$ViewerHostname,
     [string]$ConsoleHostname,
     [string]$ConsoleOriginHostname,
+    [string]$ServerUrl,
+    [string]$SecretFile,
 
     [switch]$DisableConsole,
     [switch]$Tunnel,
@@ -47,7 +49,7 @@ ai-stack management
   .\ai-stack.ps1 status
   .\ai-stack.ps1 doctor
   .\ai-stack.ps1 logs [-Service litellm|agentmemory|cloudflared]
-  .\ai-stack.ps1 install-clients [-Client All|Copilot|Codex]
+  .\ai-stack.ps1 install-clients [-Client All|Copilot|Codex] [-ServerUrl https://api.mem.example.com] [-SecretFile C:\secure\agentmemory-secret]
   .\ai-stack.ps1 install-capture [-Agent All|Copilot|Pi|Hermes]
   .\ai-stack.ps1 import-sessions [-Source All|Hermes|Pi|Copilot|VSCode] [-DryRun] [-Force]
   .\ai-stack.ps1 enrich-sessions [-Source All|Hermes|Pi|Copilot|VSCode] [-DryRun] [-Force]
@@ -100,7 +102,25 @@ ai-stack management
         Show-AiStackLogs -Service $Service
     }
     'install-clients' {
-        Install-AiStackClients -Client $Client
+        $installArguments = @{ Client = $Client }
+        $resolvedServerUrl = $ServerUrl
+        if (-not $PSBoundParameters.ContainsKey('ServerUrl')) {
+            $resolvedServerUrl = Read-Host 'AgentMemory server URL (leave blank to use the local stack)'
+        }
+        if (-not [string]::IsNullOrWhiteSpace($resolvedServerUrl)) {
+            $installArguments.ServerUrl = $resolvedServerUrl.Trim()
+            $resolvedSecretFile = $SecretFile
+            if (-not $PSBoundParameters.ContainsKey('SecretFile')) {
+                do {
+                    $resolvedSecretFile = Read-Host 'Path to the remote server agentmemory-secret file'
+                } while ([string]::IsNullOrWhiteSpace($resolvedSecretFile))
+            }
+            $installArguments.SecretFile = $resolvedSecretFile
+        }
+        elseif ($PSBoundParameters.ContainsKey('SecretFile')) {
+            throw 'SecretFile requires ServerUrl.'
+        }
+        Install-AiStackClients @installArguments
     }
     'install-capture' {
         Install-AiStackCapture -Agent $Agent

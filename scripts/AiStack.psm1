@@ -19,6 +19,9 @@ $script:ComposePath = Join-Path $script:Root 'compose.yaml'
 $script:StatePath = $script:DataPath
 $script:McpLauncherPath = Join-Path $script:StatePath 'agentmemory-mcp.ps1'
 $script:AgentMemorySecretPath = Join-Path $script:StatePath 'agentmemory-secret'
+$script:RemoteClientPath = Join-Path $script:StatePath 'remote-client'
+$script:RemoteMcpLauncherPath = Join-Path $script:RemoteClientPath 'agentmemory-mcp.ps1'
+$script:RemoteAgentMemorySecretPath = Join-Path $script:RemoteClientPath 'agentmemory-secret'
 $script:ConsoleOriginSecretPath = Join-Path $script:StatePath 'console-origin-secret'
 $script:CloudflareStatePath = Join-Path $script:StatePath 'cloudflared'
 $script:CloudflareConfigPath = Join-Path $script:CloudflareStatePath 'config.yml'
@@ -212,13 +215,25 @@ function Move-LegacyAiStackState {
 }
 
 function New-McpLauncher {
-    if (-not (Test-Path -LiteralPath $script:StatePath)) {
-        New-Item -ItemType Directory -Path $script:StatePath | Out-Null
+    param(
+        [string]$OutputPath = $script:McpLauncherPath,
+        [string]$ServerUrl
+    )
+
+    $outputDirectory = Split-Path $OutputPath -Parent
+    if (-not (Test-Path -LiteralPath $outputDirectory)) {
+        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
     }
 
     $relativeEnvPath = '.env'
-    $content = @"
+    $preamble = @"
 `$ErrorActionPreference = 'Stop'
+`$secretPath = Join-Path `$PSScriptRoot 'agentmemory-secret'
+`$env:AGENTMEMORY_SECRET = [System.IO.File]::ReadAllText(`$secretPath).Trim()
+"@
+    $preamble += [Environment]::NewLine
+    if ([string]::IsNullOrWhiteSpace($ServerUrl)) {
+        $content = $preamble + @"
 `$envPath = [System.IO.Path]::GetFullPath((Join-Path `$PSScriptRoot '$relativeEnvPath'))
 `$restPort = '3111'
 foreach (`$line in Get-Content -LiteralPath `$envPath) {
@@ -226,15 +241,78 @@ foreach (`$line in Get-Content -LiteralPath `$envPath) {
         `$restPort = `$matches[1].Trim()
     }
 }
-`$secretPath = Join-Path `$PSScriptRoot 'agentmemory-secret'
-`$env:AGENTMEMORY_SECRET = [System.IO.File]::ReadAllText(`$secretPath).Trim()
 `$env:AGENTMEMORY_URL = "http://localhost:`$restPort"
+"@
+    }
+    else {
+        $escapedServerUrl = $ServerUrl.Replace("'", "''")
+        $content = $preamble + @"
+`$env:AGENTMEMORY_URL = '$escapedServerUrl'
+`$env:AGENTMEMORY_FORCE_PROXY = 'true'
+"@
+    }
+    $content += [Environment]::NewLine
+    $content += @"
 `$env:AGENTMEMORY_TOOLS = 'all'
 `$npx = if (Get-Command npx.cmd -ErrorAction SilentlyContinue) { 'npx.cmd' } else { 'npx' }
 & `$npx -y '@agentmemory/mcp@0.9.28'
 exit `$LASTEXITCODE
 "@
-    Write-Utf8NoBom -Path $script:McpLauncherPath -Content $content
+    Write-Utf8NoBom -Path $OutputPath -Content $content
+}
+
+function Get-NormalizedRemoteAgentMemoryUrl {
+    param([Parameter(Mandatory = $true)][string]$ServerUrl)
+
+    $parsed = $null
+    if (-not [uri]::TryCreate($ServerUrl.Trim(), [UriKind]::Absolute, [ref]$parsed) -or
+        $parsed.Scheme -ne 'https' -or
+        [string]::IsNullOrWhiteSpace($parsed.Host)) {
+        throw 'ServerUrl must be an absolute HTTPS URL such as https://api.mem.example.com.'
+    }
+    if (-not [string]::IsNullOrEmpty($parsed.UserInfo) -or
+        -not [string]::IsNullOrEmpty($parsed.Query) -or
+        -not [string]::IsNullOrEmpty($parsed.Fragment) -or
+        $parsed.AbsolutePath -notin @('', '/')) {
+        throw 'ServerUrl must contain only an HTTPS origin without credentials, a path, query, or fragment.'
+    }
+    return $parsed.GetLeftPart([UriPartial]::Authority).TrimEnd('/')
+}
+
+function Initialize-AiStackRemoteClientConfiguration {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ServerUrl,
+        [Parameter(Mandatory = $true)][string]$SecretFile
+    )
+
+    $normalizedUrl = Get-NormalizedRemoteAgentMemoryUrl -ServerUrl $ServerUrl
+    $requestedSecretPath = $SecretFile.Trim().Trim('"')
+    try {
+        $sourcePath = (Resolve-Path -LiteralPath $requestedSecretPath -ErrorAction Stop).ProviderPath
+    }
+    catch {
+        throw "SecretFile does not exist: '$requestedSecretPath'."
+    }
+    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+        throw "SecretFile is not a file: '$sourcePath'."
+    }
+    $secret = [System.IO.File]::ReadAllText($sourcePath).Trim()
+    if ([string]::IsNullOrWhiteSpace($secret) -or $secret -match '\s') {
+        throw 'SecretFile must contain one non-empty bearer token without whitespace.'
+    }
+
+    if (-not (Test-Path -LiteralPath $script:RemoteClientPath)) {
+        New-Item -ItemType Directory -Path $script:RemoteClientPath -Force | Out-Null
+    }
+    Write-Utf8NoBom -Path $script:RemoteAgentMemorySecretPath -Content $secret
+    New-McpLauncher -OutputPath $script:RemoteMcpLauncherPath -ServerUrl $normalizedUrl
+    Protect-AiStackData
+
+    return [pscustomobject]@{
+        LauncherPath = $script:RemoteMcpLauncherPath
+        ServerUrl = $normalizedUrl
+    }
 }
 
 function Update-MigratedClientLaunchers {
@@ -1247,15 +1325,36 @@ function Get-AiStackClientCommand {
 
 function Install-AiStackClients {
     [CmdletBinding()]
-    param([ValidateSet('All', 'Copilot', 'Codex')][string]$Client = 'All')
+    param(
+        [ValidateSet('All', 'Copilot', 'Codex')][string]$Client = 'All',
+        [string]$ServerUrl,
+        [string]$SecretFile
+    )
 
-    Initialize-AiStackConfiguration
+    if ([string]::IsNullOrWhiteSpace($ServerUrl)) {
+        if (-not [string]::IsNullOrWhiteSpace($SecretFile)) {
+            throw 'SecretFile is valid only when ServerUrl selects a remote AgentMemory server.'
+        }
+        Initialize-AiStackConfiguration
+        $launcherPath = $script:McpLauncherPath
+        $connectionDescription = 'local AgentMemory at localhost'
+    }
+    else {
+        if ([string]::IsNullOrWhiteSpace($SecretFile)) {
+            throw 'SecretFile is required when ServerUrl selects a remote AgentMemory server.'
+        }
+        $remote = Initialize-AiStackRemoteClientConfiguration `
+            -ServerUrl $ServerUrl `
+            -SecretFile $SecretFile
+        $launcherPath = $remote.LauncherPath
+        $connectionDescription = "remote AgentMemory at $($remote.ServerUrl)"
+    }
     $homePath = $script:ClientHome
 
     if ($Client -in @('All', 'Copilot')) {
         $copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $homePath '.copilot' }
         $copilotConfig = Join-Path $copilotHome 'mcp-config.json'
-        [void](Merge-CopilotMcpConfig -Path $copilotConfig -LauncherPath $script:McpLauncherPath)
+        [void](Merge-CopilotMcpConfig -Path $copilotConfig -LauncherPath $launcherPath)
         $copilotCommand = Get-AiStackClientCommand `
             -Name 'copilot' `
             -WinGetPackage 'GitHub.Copilot' `
@@ -1276,7 +1375,7 @@ function Install-AiStackClients {
     if ($Client -in @('All', 'Codex')) {
         $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $homePath '.codex' }
         $codexConfig = Join-Path $codexHome 'config.toml'
-        [void](Merge-CodexMcpConfig -Path $codexConfig -LauncherPath $script:McpLauncherPath)
+        [void](Merge-CodexMcpConfig -Path $codexConfig -LauncherPath $launcherPath)
         $codexCommand = Get-AiStackClientCommand `
             -Name 'codex' `
             -WinGetPackage 'OpenAI.Codex' `
@@ -1298,7 +1397,8 @@ function Install-AiStackClients {
         }
     }
 
-    Write-Host 'Client configuration complete. Restart desktop apps and approve plugin trust in their UI when prompted.'
+    Write-Host "Client configuration complete for $connectionDescription."
+    Write-Host 'Restart desktop apps and approve plugin trust in their UI when prompted.'
 }
 
 function New-DoctorResult {

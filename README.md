@@ -104,7 +104,7 @@ Open the local interfaces at:
 | `status` | Shows Compose service state |
 | `doctor` | Checks Docker, local config, Node, health endpoints, and capture integrations |
 | `logs [-Service ...]` | Follows redacted-by-design service logs |
-| `install-clients` | Merges MCP config and installs official upstream plugins |
+| `install-clients` | Interactively selects local or remote AgentMemory, merges MCP config, and installs official upstream plugins |
 | `install-capture [-Agent ...]` | Installs official live-capture integrations for Copilot, pi, and Hermes |
 | `import-sessions [-Source ...] [-DryRun]` | Backfills supported local conversation histories into AgentMemory |
 | `enrich-sessions [-Source ...] [-DryRun]` | Resumably summarizes imports, builds graph batches, and consolidates memory |
@@ -184,9 +184,26 @@ plugin-local lifecycle hooks may require `agentmemory connect codex
 --with-hooks` until desktop hook dispatch support lands. That optional upstream
 workaround modifies global hooks and is not run automatically by ai-stack.
 
-This is a **local MCP** design: the desktop/CLI launches a stdio process, and
-that process calls AgentMemory REST on localhost. It is not a public,
-Streamable HTTP MCP server.
+This is a **stdio MCP** design: the desktop/CLI launches a local process, and
+that process calls either local or explicitly configured remote AgentMemory
+REST. It is not a public Streamable HTTP MCP server.
+
+To connect clients on another machine to an HTTPS AgentMemory REST endpoint,
+securely transfer the server's `~\.ai-stack\agentmemory-secret` as a file, then
+run:
+
+```powershell
+.\ai-stack.ps1 install-clients `
+  -ServerUrl https://memory-api.example.com `
+  -SecretFile C:\secure\agentmemory-secret
+```
+
+When those parameters are omitted, `install-clients` asks whether to use the
+local stack or a remote URL and prompts for the secret-file path only when
+needed. The remote bearer is copied into ACL-restricted
+`~\.ai-stack\remote-client`; Copilot and Codex configs contain only the launcher
+path. Remote launchers force REST proxy mode so an unavailable server cannot
+silently fall back to process-local memory.
 
 ## Continuous capture
 

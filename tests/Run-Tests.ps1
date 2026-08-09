@@ -355,6 +355,56 @@ try {
         Assert-True ($module -match "'rm', '--stop', '--force', 'cloudflared'") 'Disabling the tunnel leaves an exited container that restart can re-enable.'
     }
 
+    Invoke-Test 'Remote client launcher is protected and idempotent' {
+        $sourceSecret = Join-Path $tempRoot 'remote-agentmemory-secret'
+        $remoteSecret = 'am_' + ('a' * 64)
+        [System.IO.File]::WriteAllText(
+            $sourceSecret,
+            $remoteSecret,
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $localSecretBefore = [System.IO.File]::ReadAllText((Join-Path $testDataPath 'agentmemory-secret'))
+        $module = Get-Module AiStack
+        $first = & $module {
+            param($url, $secretFile)
+            Initialize-AiStackRemoteClientConfiguration -ServerUrl $url -SecretFile $secretFile
+        } 'https://api.mem.example.com' $sourceSecret
+        $launcherBefore = [System.IO.File]::ReadAllText($first.LauncherPath)
+        $launcherTokens = $null
+        $launcherErrors = $null
+        [void][System.Management.Automation.Language.Parser]::ParseFile(
+            $first.LauncherPath,
+            [ref]$launcherTokens,
+            [ref]$launcherErrors
+        )
+        $second = & $module {
+            param($url, $secretFile)
+            Initialize-AiStackRemoteClientConfiguration -ServerUrl $url -SecretFile $secretFile
+        } 'https://api.mem.example.com/' $sourceSecret
+        $launcherAfter = [System.IO.File]::ReadAllText($second.LauncherPath)
+
+        Assert-Equal $launcherBefore $launcherAfter 'Remote launcher changed on an idempotent rerun.'
+        Assert-Equal 0 $launcherErrors.Count ($launcherErrors -join [Environment]::NewLine)
+        Assert-Equal $localSecretBefore ([System.IO.File]::ReadAllText((Join-Path $testDataPath 'agentmemory-secret')) ) 'Remote installation replaced the local stack secret.'
+        Assert-Equal $remoteSecret ([System.IO.File]::ReadAllText((Join-Path $testDataPath 'remote-client\agentmemory-secret'))) 'Remote secret was not imported.'
+        Assert-True ($launcherAfter -match [regex]::Escape("`$env:AGENTMEMORY_URL = 'https://api.mem.example.com'")) 'Remote launcher has the wrong server URL.'
+        Assert-True ($launcherAfter -match "AGENTMEMORY_FORCE_PROXY = 'true'") 'Remote launcher can silently fall back to local in-memory storage.'
+        Assert-True ($launcherAfter -notmatch [regex]::Escape($remoteSecret)) 'Remote launcher embeds the bearer token.'
+        $invalidRejected = $false
+        try {
+            & $module {
+                param($secretFile)
+                Initialize-AiStackRemoteClientConfiguration `
+                    -ServerUrl 'http://api.mem.example.com' `
+                    -SecretFile $secretFile
+            } $sourceSecret
+        }
+        catch {
+            $invalidRejected = $true
+        }
+        Assert-True $invalidRejected 'Remote client configuration accepted a non-HTTPS server.'
+    }
+
     Invoke-Test 'Copilot JSON merge preserves servers and is idempotent' {
         $copilotPath = Join-Path $tempRoot 'copilot\mcp-config.json'
         New-Item -ItemType Directory -Path (Split-Path $copilotPath -Parent) | Out-Null
